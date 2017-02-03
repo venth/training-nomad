@@ -1,0 +1,6 @@
+# helping scripts
+*.sh
+
+# IntelliJ
+*.iml
+.idea

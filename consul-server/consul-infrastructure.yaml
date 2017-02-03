@@ -1,0 +1,790 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Infrastructure for Consul cluster
+Parameters:
+  pResourceNamePrefix:
+    Type: String
+    Description: prefix used in creation of name for each resource in this template
+  pKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the ECS instances.
+  pDesiredCapacity:
+    Type: Number
+    Default: 3
+    AllowedValues:
+      - 3
+      - 5
+      - 7
+    Description: Number of member instances to launch in your Consul cluster. Note that the cluster always have one leader apart from the members
+  pInstanceType:
+    Description: The EC2 instance type
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - m4.large
+      - m4.xlarge
+      - m4.2xlarge
+      - m4.4xlarge
+      - m4.10xlarge
+      - m3.medium
+      - m3.large
+      - m3.xlarge
+      - m3.2xlarge
+      - c4.large
+      - c4.xlarge
+      - c4.2xlarge
+      - c4.4xlarge
+      - c4.8xlarge
+      - c3.large
+      - c3.xlarge
+      - c3.2xlarge
+      - c3.4xlarge
+      - c3.8xlarge
+      - r3.large
+      - r3.xlarge
+      - r3.2xlarge
+      - r3.4xlarge
+      - r3.8xlarge
+      - i2.xlarge
+      - i2.2xlarge
+      - i2.4xlarge
+      - i2.8xlarg
+    ConstraintDescription: EC2 instance types for consul cluster
+  pVpcId:
+    Description: Unique identifier of vpc to host consul cluster
+    Type: AWS::EC2::VPC::Id
+  pSubnetIds:
+    Description: Unique identifier of subnets inside given vpc to host consul cluster
+    Type: List<AWS::EC2::Subnet::Id>
+  pClusterMemberAmiId:
+    Description: unique identifier of AMI used to spin up cluster members
+    Type: AWS::EC2::Image::Id
+    Default: ami-f9619996
+  pHostedZoneName:
+    Description: Hosted zone name defined in Route 53
+    Type: String
+  pSSHAccessCIDR:
+    Description: IP adresses allowed to access Consul cluster members machines
+    Type: String
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/([0-9]|[1-2][0-9]|3[0-2]))$"
+  pHTTPAccessCIDR:
+    Description: IP adresses allowed to access Consul cluster UI
+    Type: String
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/([0-9]|[1-2][0-9]|3[0-2]))$"
+  pConsulClusterTagName:
+    Description: The name of the tag used to identify a role in consul cluster by value
+    Type: String
+    Default: consul-cluster-role
+  pConsulClusterTagLeaderValue:
+    Description: The value of the tag used to identify leader role in consul cluster
+    Type: String
+    Default: leader
+  pConsulClusterTagMemberValue:
+    Description: The value of the tag used to identify member role in consul cluster
+    Type: String
+    Default: member
+  pConsulVersion:
+    Description: Version of consul server
+    Type: String
+    Default: 0.7.1
+  pConsulIAMStack:
+    Type: String
+    Description: |
+      Name of the stack containing IAM roles and instance profiles that can be assumed
+      by container instances in ecs cluster and services / tasks running on this cluster.
+      Expected exported outputs: ConsulServerMemberInstanceProfile
+
+
+Mappings:
+  # this mapping is used to model leader - member architecture and keep odd number of all servers
+  # in cluster.
+  # members represent desired capacity of members (note that leader can be only one)
+  # maxMembersCapacity represents space which will be used in case of rolling update
+  mDesiredCapacity:
+    '3':
+      members: 2
+      maxMembersCapacity: 4
+    '5':
+      members: 4
+      maxMembersCapacity: 6
+    '7':
+      members: 6
+      maxMembersCapacity: 8
+
+
+Rules:
+  uSubnetsInVPC:
+    Assertions:
+      - Assert: !EachMemberIn
+        - Fn::ValueOfAll:
+          - AWS::EC2::Subnet::Id
+          - VpcId
+        - Fn::RefAll: AWS::EC2::VPC::Id
+        AssertDescription: All subnets must in the VPC
+
+
+Resources:
+  rConsulLeaderLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_install_consul:
+              command: !Sub |
+                #!/bin/bash
+                mkdir /tmp/bin
+                cd /tmp/bin
+                wget https://releases.hashicorp.com/consul/${pConsulVersion}/consul_${pConsulVersion}_linux_amd64.zip
+                wget https://releases.hashicorp.com/consul/${pConsulVersion}/consul_${pConsulVersion}_web_ui.zip
+                unzip consul_${pConsulVersion}_web_ui.zip
+                unzip consul_${pConsulVersion}_linux_amd64.zip
+                rm -f ./*.zip
+
+                mkdir -p /var/consul/data
+                mkdir -p /var/consul/www
+
+                useradd -s /bin/false -d /home/consul -r consul
+                chown -R consul /home/consul
+                chown -R consul /var/consul
+
+                mkdir -p /etc/consul.d/{server,bootstrap}
+                mv consul /usr/local/bin/
+                chmod 755 /usr/local/bin/consul
+                mv index.html /var/consul/www/
+                mv static/ /var/consul/www/
+
+                # Add consul user to sudoers and disable tty
+                echo "consul ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+                echo "Defaults:%consul !requiretty" >> /etc/sudoers
+                echo "Defaults:consul !requiretty" >> /etc/sudoers
+          files:
+            /etc/consul.d/bootstrap/config.json:
+              content: !Sub |
+                {
+                    "bootstrap": true,
+                    "datacenter": "${AWS::Region}",
+                    "server": true,
+                    "data_dir": "/var/consul/data",
+                    "skip_leave_on_interrupt": true,
+                    "leave_on_terminate": true
+                }
+              mode: '000444'
+              owner: root
+              group: root
+            /etc/consul.d/server/config.json:
+              content: !Sub |
+                {
+                  "log_level": "INFO",
+                  "datacenter": "${AWS::Region}",
+                  "server": true,
+                  "disable_update_check": true,
+                  "dns_config": {
+                    "allow_stale": true,
+                    "max_stale": "3s"
+                  },
+                  "leave_on_terminate": true
+                }
+              mode: '000444'
+              owner: root
+              group: root
+            /etc/init.d/consul-server:
+              content: !Sub
+                - |
+                  #!/bin/bash
+                  # consul-server daemon
+                  # chkconfig: 345 20 80
+                  # description: consul-server daemon
+                  # processname: consul-server
+
+                  DAEMON=/usr/local/bin/consul
+
+                  NAME=consul-server
+                  DESC="Consul Server Member"
+                  PIDFILE=/var/run/$NAME.pid
+                  LOGFILE=/var/log/$NAME.log
+                  SCRIPTNAME=/etc/init.d/$NAME
+
+                  ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+
+                  case "$1" in
+                  start)
+                    printf "%-50s" "Starting $NAME..."
+                    DATACENTER="${AWS::Region}"
+                    DAEMONOPTS="$(cat << EOF
+                      agent -domain 'consul.' \
+                          -advertise $ADVERTISE_IP \
+                          -ui \
+                          -server \
+                          -datacenter ${DATACENTER} \
+                          -client 0.0.0.0 \
+                          -bootstrap-expect ${vDesiredMembersCapacity} \
+                          -data-dir /var/consul/data \
+                          -ui-dir /var/consul/www \
+                          -config-file /etc/consul.d/server/config.json \
+                          -rejoin -retry-join-ec2-tag-key ${pConsulClusterTagName} \
+                          -retry-join-ec2-tag-value ${pConsulClusterTagMemberValue} \
+                          -retry-join-ec2-region ${AWS::Region}
+                    EOF)"
+                    touch $LOGFILE
+                    chmod 0644 $LOGFILE
+                    PID=$($DAEMON $DAEMONOPTS > $LOGFILE 2>&1 & echo $!)
+                    #echo "Saving PID" $PID " to " $PIDFILE
+                          if [ -z $PID ]; then
+                              printf "%s\n" "Fail"
+                          else
+                              echo $PID > $PIDFILE
+                              printf "%s\n" "Ok"
+                          fi
+                  ;;
+                  status)
+                          printf "%-50s" "Checking $NAME..."
+                          if [ -f $PIDFILE ]; then
+                              PID=$(cat $PIDFILE)
+                              if [ -z "$(ps axf | grep $PID | grep -v grep)" ]; then
+                                  printf "%s\n" "Process dead but pidfile exists"
+                              else
+                                  echo "Running"
+                              fi
+                          else
+                              printf "%s\n" "Service not running"
+                          fi
+                  ;;
+                  stop)
+                          printf "%-50s" "Stopping $NAME"
+                              PID=$(cat $PIDFILE)
+                          if [ -f $PIDFILE ]; then
+                              kill -HUP $PID
+                              printf "%s\n" "Ok"
+                              rm -f $PIDFILE
+                          else
+                              printf "%s\n" "pidfile not found"
+                          fi
+                  ;;
+
+                  restart)
+                        $0 stop
+                        $0 start
+                  ;;
+
+                  *)
+                          echo "Usage: $0 {status|start|stop|restart}"
+                          exit 1
+                  esac
+                - { vDesiredMembersCapacity: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ] }
+              mode: '000755'
+              owner: root
+              group: root
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack = ${AWS::StackId}
+                region = ${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.ContainerInstances.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource rConsulLeaderLaunchConfiguration --region ${AWS::Region}
+                runas=root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+              consul-server:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/init.d/consul-server
+                  - /etc/consul.d/server/config.json
+                  - /etc/consul.d/bootstrap/config.json
+    Properties:
+      IamInstanceProfile: !ImportValue
+        Fn::Sub: "${pConsulIAMStack}-ConsulServerMemberInstanceProfile"
+      ImageId: !Ref pClusterMemberAmiId
+      InstanceMonitoring: false
+      InstanceType: !Ref pInstanceType
+      KeyName: !Ref pKeyName
+      SecurityGroups:
+        - !Ref rSSHAccessSecurityGroup
+        - !Ref rConsulClusterSecurityGroup
+        - !Ref rConsulRPCAndGossipSecurityGroup
+        - !Ref rConsulHTTPSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum install -y \
+              aws-cfn-bootstrap \
+              unzip \
+              wget
+
+          function error_exit
+          {
+            /opt/aws/bin/cfn-signal \
+                --success false \
+                --reason 'look on /var/log' \
+                --stack ${AWS::StackName} \
+                --resource rConsulLeaderAutoScalingGroup \
+                --region ${AWS::Region}
+            exit 1
+          }
+
+          /opt/aws/bin/cfn-init -v \
+              --stack ${AWS::StackName} \
+              --resource rConsulLeaderLaunchConfiguration \
+              --region ${AWS::Region} || error_exit
+
+          IP=$(ip addr show dev eth0|awk '/inet /{print $2}'|cut -d/ -f1)
+          while ! curl -s http://localhost:8500/v1/status/peers | grep -q $IP:; do
+            echo "Waiting for consul"
+            sleep 1
+          done
+
+          /opt/aws/bin/cfn-signal --success true \
+              --stack ${AWS::StackName} \
+              --resource rConsulLeaderAutoScalingGroup \
+              --region ${AWS::Region}
+
+
+  rConsulLeaderAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: 1
+      HealthCheckGracePeriod: 5
+      HealthCheckType: ELB
+      LoadBalancerNames:
+        - !Ref rConsulLoadBalancer
+      LaunchConfigurationName: !Ref rConsulLeaderLaunchConfiguration
+      MaxSize: 2
+      MinSize: 0
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-leader-asg"
+          PropagateAtLaunch: true
+        - Key: role
+          Value: consul-leader
+          PropagateAtLaunch: true
+      VPCZoneIdentifier: !Ref "pSubnetIds"
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        PauseTime: PT10M
+        WaitOnResourceSignals: true
+
+
+
+  rConsulMemberLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_install_consul:
+              command: !Sub |
+                #!/bin/bash
+                mkdir /tmp/bin
+                cd /tmp/bin
+                wget https://releases.hashicorp.com/consul/${pConsulVersion}/consul_${pConsulVersion}_linux_amd64.zip
+                wget https://releases.hashicorp.com/consul/${pConsulVersion}/consul_${pConsulVersion}_web_ui.zip
+                unzip consul_${pConsulVersion}_web_ui.zip
+                unzip consul_${pConsulVersion}_linux_amd64.zip
+                rm -f ./*.zip
+
+                mkdir -p /var/consul/data
+                mkdir -p /var/consul/www
+
+                useradd -s /bin/false -d /home/consul -r consul
+                chown -R consul /home/consul
+                chown -R consul /var/consul
+
+                mkdir -p /etc/consul.d/
+                mv consul /usr/local/bin/
+                chmod 755 /usr/local/bin/consul
+                mv index.html /var/consul/www/
+                mv static/ /var/consul/www/
+
+                # Add consul user to sudoers and disable tty
+                echo "consul ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+                echo "Defaults:%consul !requiretty" >> /etc/sudoers
+                echo "Defaults:consul !requiretty" >> /etc/sudoers
+          files:
+            /etc/consul.d/bootstrap/config.json:
+              content: !Sub |
+                {
+                    "bootstrap": true,
+                    "datacenter": "${AWS::Region}",
+                    "server": true,
+                    "data_dir": "/var/consul/data",
+                    "skip_leave_on_interrupt": true,
+                    "leave_on_terminate": true
+                }
+              mode: '000444'
+              owner: root
+              group: root
+            /etc/consul.d/server/config.json:
+              content: !Sub |
+                {
+                  "log_level": "INFO",
+                  "datacenter": "${AWS::Region}",
+                  "server": true,
+                  "disable_update_check": true,
+                  "dns_config": {
+                    "allow_stale": true,
+                    "max_stale": "3s"
+                  },
+                  "leave_on_terminate": true
+                }
+              mode: '000444'
+              owner: root
+              group: root
+            /etc/init.d/consul-server:
+              content: !Sub
+                - |
+                  #!/bin/bash
+                  # consul-server daemon
+                  # chkconfig: 345 20 80
+                  # description: consul-server daemon
+                  # processname: consul-server
+
+                  DAEMON=/usr/local/bin/consul
+
+                  NAME=consul-server
+                  DESC="Consul Server Member"
+                  PIDFILE=/var/run/$NAME.pid
+                  LOGFILE=/var/log/$NAME.log
+                  SCRIPTNAME=/etc/init.d/$NAME
+
+                  ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+
+                  case "$1" in
+                  start)
+                    printf "%-50s" "Starting $NAME..."
+                    DATACENTER = "${AWS::Region}"
+                    DAEMONOPTS="$(cat << EOF
+                        agent -domain 'consul.' \
+                            -advertise $ADVERTISE_IP \
+                            -ui \
+                            -server \
+                            -datacenter ${DATACENTER} \
+                            -client 0.0.0.0 \
+                            -bootstrap-expect ${vDesiredMembersCapacity} \
+                            -data-dir /var/consul/data \
+                            -ui-dir /var/consul/www  \
+                            -config-file /etc/consul.d/server/config.json \
+                            -rejoin -retry-join-ec2-tag-key ${pConsulClusterTagName} \
+                            -retry-join-ec2-tag-value ${pConsulClusterTagLeaderValue} \
+                            -retry-join-ec2-region ${AWS::Region}
+                    EOF)"
+                    touch $LOGFILE
+                    chmod 0644 $LOGFILE
+                    PID=$($DAEMON $DAEMONOPTS > $LOGFILE 2>&1 & echo $!)
+                    #echo "Saving PID" $PID " to " $PIDFILE
+                          if [ -z $PID ]; then
+                              printf "%s\n" "Fail"
+                          else
+                              echo $PID > $PIDFILE
+                              printf "%s\n" "Ok"
+                          fi
+                  ;;
+                  status)
+                          printf "%-50s" "Checking $NAME..."
+                          if [ -f $PIDFILE ]; then
+                              PID=$(cat $PIDFILE)
+                              if [ -z "$(ps axf | grep $PID | grep -v grep)" ]; then
+                                  printf "%s\n" "Process dead but pidfile exists"
+                              else
+                                  echo "Running"
+                              fi
+                          else
+                              printf "%s\n" "Service not running"
+                          fi
+                  ;;
+                  stop)
+                          printf "%-50s" "Stopping $NAME"
+                              PID=$(cat $PIDFILE)
+                          if [ -f $PIDFILE ]; then
+                              kill -HUP $PID
+                              printf "%s\n" "Ok"
+                              rm -f $PIDFILE
+                          else
+                              printf "%s\n" "pidfile not found"
+                          fi
+                  ;;
+
+                  restart)
+                        $0 stop
+                        $0 start
+                  ;;
+
+                  *)
+                          echo "Usage: $0 {status|start|stop|restart}"
+                          exit 1
+                  esac
+                - { vDesiredMembersCapacity: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ] }
+              mode: '000755'
+              owner: root
+              group: root
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack = ${AWS::StackId}
+                region = ${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.ContainerInstances.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource rConsulMemberLaunchConfiguration --region ${AWS::Region}
+                runas=root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+              consul-server:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/init.d/consul-server
+                  - /etc/consul.d/server/config.json
+                  - /etc/consul.d/bootstrap/config.json
+    Properties:
+      IamInstanceProfile: !ImportValue
+        Fn::Sub: "${pConsulIAMStack}-ConsulServerMemberInstanceProfile"
+      ImageId: !Ref pClusterMemberAmiId
+      InstanceMonitoring: false
+      InstanceType: !Ref pInstanceType
+      KeyName: !Ref pKeyName
+      SecurityGroups:
+        - !Ref rSSHAccessSecurityGroup
+        - !Ref rConsulClusterSecurityGroup
+        - !Ref rConsulRPCAndGossipSecurityGroup
+        - !Ref rConsulHTTPSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum install -y \
+              aws-cfn-bootstrap \
+              unzip \
+              wget
+
+          function error_exit
+          {
+            /opt/aws/bin/cfn-signal \
+                --success false \
+                --reason 'look on /var/log' \
+                --stack ${AWS::StackName} \
+                --resource rConsulMemberAutoScalingGroup \
+                --region ${AWS::Region}
+            exit 1
+          }
+
+          /opt/aws/bin/cfn-init -v \
+              --stack ${AWS::StackName} \
+              --resource rConsulMemberLaunchConfiguration \
+              --region ${AWS::Region} || error_exit
+
+          IP=$(ip addr show dev eth0|awk '/inet /{print $2}'|cut -d/ -f1)
+          while ! curl -s http://localhost:8500/v1/status/peers | grep -q $IP:; do
+            echo "Waiting for consul"
+            sleep 1
+          done
+
+          /opt/aws/bin/cfn-signal --success true \
+              --stack ${AWS::StackName} \
+              --resource rConsulMemberAutoScalingGroup \
+              --region ${AWS::Region}
+
+
+  rConsulMemberAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ]
+      HealthCheckGracePeriod: 5
+      HealthCheckType: ELB
+      LaunchConfigurationName: !Ref rConsulMemberLaunchConfiguration
+      LoadBalancerNames:
+        - !Ref rConsulLoadBalancer
+      MaxSize: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, maxMembersCapacity ]
+      MinSize: 0
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-member-asg"
+          PropagateAtLaunch: true
+        - Key: role
+          Value: consul-member
+          PropagateAtLaunch: true
+      VPCZoneIdentifier: !Ref "pSubnetIds"
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ]
+        PauseTime: PT10M
+        WaitOnResourceSignals: true
+
+
+  rSSHAccessSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for accessing consul members by SSH
+      SecurityGroupIngress:
+        - CidrIp: !Ref pSSHAccessCIDR
+          FromPort: 22
+          IpProtocol: TCP
+          ToPort: 22
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-ssh-sg"
+      VpcId: !Ref pVpcId
+
+
+  rConsulClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Marking group of consul members to allow bi-directional communication between members. It can be used in conjuction with rConsulRPCAndGossipSecurityGroup to enable gossips, dns recognitions, rpc...
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-consul-cluster-sg"
+      VpcId: !Ref pVpcId
+
+
+  rConsulRPCAndGossipSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allows gossips, rpc calls and dns recognition among consul cluster members
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref rConsulClusterSecurityGroup
+          FromPort: 8300
+          IpProtocol: TCP
+          ToPort: 8302
+        - SourceSecurityGroupId: !Ref rConsulClusterSecurityGroup
+          FromPort: 8300
+          IpProtocol: UDP
+          ToPort: 8302
+        - SourceSecurityGroupId: !Ref rConsulClusterSecurityGroup
+          FromPort: 8600
+          IpProtocol: TCP
+          ToPort: 8600
+        - SourceSecurityGroupId: !Ref rConsulClusterSecurityGroup
+          FromPort: 8600
+          IpProtocol: UDP
+          ToPort: 8600
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-consul-gossip-sg"
+      VpcId: !Ref pVpcId
+
+
+  rConsulHTTPSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allows gossips and rpc calls among consul cluster members
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref rConsulClusterSecurityGroup
+          FromPort: 8500
+          IpProtocol: TCP
+          ToPort: 8500
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-consul-http-sg"
+      VpcId: !Ref pVpcId
+
+
+  rHTTPAccessToElbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for accessing by HTTP
+      SecurityGroupIngress:
+        - CidrIp: !Ref pHTTPAccessCIDR
+          FromPort: 80
+          ToPort: 80
+          IpProtocol: TCP
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-http-elb-sg"
+      VpcId: !Ref pVpcId
+
+
+  rConsulLoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      Listeners:
+        - LoadBalancerPort: '80'
+          InstancePort: '8500'
+          Protocol: HTTP
+        - LoadBalancerPort: '8300'
+          InstancePort: '8300'
+          Protocol: TCP
+        - LoadBalancerPort: '8301'
+          InstancePort: '8301'
+          Protocol: TCP
+        - LoadBalancerPort: '8302'
+          InstancePort: '8302'
+          Protocol: TCP
+        - LoadBalancerPort: '8600'
+          InstancePort: '8600'
+          Protocol: TCP
+      HealthCheck:
+        Target: 'HTTP:8500/ui/'
+        HealthyThreshold: '3'
+        UnhealthyThreshold: '5'
+        Interval: '30'
+        Timeout: '5'
+      ConnectionDrainingPolicy:
+        Enabled: 'true'
+        Timeout: '60'
+      SecurityGroups:
+        - !Ref rHTTPAccessToElbSecurityGroup
+        - !Ref rConsulRPCAndGossipSecurityGroup
+        - !Ref rConsulClusterSecurityGroup
+      Scheme: internal
+      Subnets: !Ref pSubnetIds
+
+
+  rConsulServerDNS:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Ref pHostedZoneName
+      Comment: Alias to easier access for consul server
+      RecordSets:
+      - Name: !Sub "${pResourceNamePrefix}.${pHostedZoneName}"
+        Type: A
+        AliasTarget:
+          HostedZoneId: !GetAtt [ rConsulLoadBalancer, CanonicalHostedZoneNameID ]
+          DNSName: !GetAtt [ rConsulLoadBalancer, DNSName ]
+
+
+Outputs:
+  ConsulClusterSecurityGroup:
+    Description: Marking group of consul members to allow bi-directional communication between members. It can be used in conjuction with rConsulRPCAndGossipSecurityGroup to enable gossips, dns recognitions, rpc...
+    Value: !Ref rConsulClusterSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ConsulClusterSecurityGroup'
+
+
+  ConsulRPCAndGossipSecurityGroup:
+    Description: Allows gossips, rpc calls and dns recognition among consul cluster members
+    Value: !Ref rConsulRPCAndGossipSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ConsulRPCAndGossipSecurityGroup'

@@ -1,0 +1,769 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Infrastructure for Nomad cluster
+Parameters:
+  pResourceNamePrefix:
+    Type: String
+    Description: prefix used in creation of name for each resource in this template
+  pKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the ECS instances.
+  pDesiredCapacity:
+    Type: Number
+    Default: 3
+    AllowedValues:
+      - 3
+      - 5
+      - 7
+    Description: Number of server instances to launch in your Nomad cluster.
+  pDesiredClientCapacity:
+    Type: Number
+    Default: 1
+    Description: Number of client instances to launch in your Nomad cluster.
+  pInstanceType:
+    Description: The EC2 instance type
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - m4.large
+      - m4.xlarge
+      - m4.2xlarge
+      - m4.4xlarge
+      - m4.10xlarge
+      - m3.medium
+      - m3.large
+      - m3.xlarge
+      - m3.2xlarge
+      - c4.large
+      - c4.xlarge
+      - c4.2xlarge
+      - c4.4xlarge
+      - c4.8xlarge
+      - c3.large
+      - c3.xlarge
+      - c3.2xlarge
+      - c3.4xlarge
+      - c3.8xlarge
+      - r3.large
+      - r3.xlarge
+      - r3.2xlarge
+      - r3.4xlarge
+      - r3.8xlarge
+      - i2.xlarge
+      - i2.2xlarge
+      - i2.4xlarge
+      - i2.8xlarg
+    ConstraintDescription: EC2 instance types for Nomad cluster
+  pVpcId:
+    Description: Unique identifier of vpc to host Nomad cluster
+    Type: AWS::EC2::VPC::Id
+  pSubnetIds:
+    Description: Unique identifier of subnets inside given vpc to host Nomad cluster
+    Type: List<AWS::EC2::Subnet::Id>
+  pClusterMemberAmiId:
+    Description: unique identifier of AMI used to spin up cluster members
+    Type: AWS::EC2::Image::Id
+    Default: ami-f9619996
+  pHostedZoneName:
+    Description: Hosted zone name defined in Route 53
+    Type: String
+  pSSHAccessCIDR:
+    Description: IP adresses allowed ssh access to Nomad cluster members machines
+    Type: String
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/([0-9]|[1-2][0-9]|3[0-2]))$"
+  pConsulAgentVersion:
+    Description: Version of Consul agent
+    Type: String
+    Default: 0.7.1
+  pNomadVersion:
+    Description: Version of Nomad agent
+    Type: String
+    Default: 0.7.1
+  pConsulServerStack:
+    Type: String
+    Description: |
+      Name of the stack containing Consul Servers
+      Expected exported outputs: ConsulClusterSecurityGroup, ConsulRPCAndGossipSecurityGroup
+  pNomadIAMStack:
+    Type: String
+    Description: |
+      Name of the stack containing IAM roles and instance profiles that can be assumed
+      by ec2 instances running on this cluster.
+      Expected exported outputs: ConsulServerMemberInstanceProfile
+
+
+Mappings:
+  # this mapping is used to model leader - member architecture and keep odd number of all servers
+  # in cluster.
+  # members represent desired capacity of members (note that leader can be only one)
+  # maxMembersCapacity represents space which will be used in case of rolling update
+  mDesiredCapacity:
+    '3':
+      members: 3
+      maxMembersCapacity: 4
+    '5':
+      members: 5
+      maxMembersCapacity: 6
+    '7':
+      members: 7
+      maxMembersCapacity: 8
+
+
+Rules:
+  uSubnetsInVPC:
+    Assertions:
+      - Assert: !EachMemberIn
+        - Fn::ValueOfAll:
+          - AWS::EC2::Subnet::Id
+          - VpcId
+        - Fn::RefAll: AWS::EC2::VPC::Id
+        AssertDescription: All subnets must in the VPC
+
+
+Resources:
+  rNomadServerLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_install_consul_agent:
+              command: !Sub |
+                #!/bin/bash
+
+                curl -L
+                    'https://releases.hashicorp.com/consul/${pConsulAgentVersion}/consul_${pConsulAgentVersion}_linux_amd64.zip' \
+                    -o /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
+
+                mkdir -p /opt/consul/data
+                unzip \
+                    /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip \
+                    -d /opt/consul
+                rm -f /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
+
+                useradd -s /bin/false -d /opt/consul -r consul
+                chown -R consul /opt/consul
+                chmod 755 /opt/consul/consul
+
+                mkdir -p /etc/consul.d
+                ln -sf /opt/consul/consul /usr/local/bin/
+            02_install_nomand_server:
+              command: !Sub |
+                #!/bin/bash
+
+                curl -L
+                    'https://releases.hashicorp.com/nomad/${pNomadVersion}/nomad_${pNomadVersion}_linux_amd64.zip' \
+                    -o /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
+
+                mkdir -p /opt/nomad/data
+                unzip \
+                    /tmp/nomad_${pNomadVersion}_linux_amd64.zip \
+                    -d /opt/nomad
+                rm -f /tmp/nomad_${pNomadVersion}_linux_amd64.zip
+
+                useradd -s /bin/false -d /opt/nomad -r nomad
+                chown -R consul /opt/nomad
+                chmod 755 /opt/nomad/nomad
+
+                ln -sf /opt/nomad/nomad /usr/local/bin/
+          files:
+            /etc/consul.d/agent-config.json:
+              content: !Sub |
+                {
+                  "log_level": "INFO",
+                  "server": false,
+                  "disable_update_check": true,
+                  "dns_config": {
+                    "allow_stale": true,
+                    "max_stale": "3s"
+                  },
+                  "leave_on_terminate": true
+                }
+              mode: '000444'
+              owner: root
+              group: root
+            /etc/init.d/consul-agent:
+              content: !Sub |
+                #!/bin/bash
+                # consul-agent daemon
+                # chkconfig: 345 20 80
+                # description: consul-agent daemon
+                # processname: consul-agent
+
+                DAEMON=/usr/local/bin/consul
+
+                NAME=consul-agent
+                DESC="Consul Agent"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+
+                ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+
+                case "$1" in
+                start)
+                  printf "%-50s" "Starting $NAME..."
+                  DATACENTER = "${AWS::Region}"
+                  DAEMONOPTS="agent -domain 'consul.' -advertise $ADVERTISE_IP -datacenter ${DATACENTER} -client 0.0.0.0 -data-dir /opt/consul/data -config-file /etc/consul.d/agent-config.json -rejoin -retry-join-ec2-tag-key role -retry-join-ec2-tag-value consul-leader -retry-join-ec2-region ${AWS::Region}"
+                  touch $LOGFILE
+                  chmod 0644 $LOGFILE
+                  PID=$($DAEMON $DAEMONOPTS > $LOGFILE 2>&1 & echo $!)
+                  #echo "Saving PID" $PID " to " $PIDFILE
+                        if [ -z $PID ]; then
+                            printf "%s\n" "Fail"
+                        else
+                            echo $PID > $PIDFILE
+                            printf "%s\n" "Ok"
+                        fi
+                ;;
+                status)
+                        printf "%-50s" "Checking $NAME..."
+                        if [ -f $PIDFILE ]; then
+                            PID=$(cat $PIDFILE)
+                            if [ -z "$(ps axf | grep $PID | grep -v grep)" ]; then
+                                printf "%s\n" "Process dead but pidfile exists"
+                            else
+                                echo "Running"
+                            fi
+                        else
+                            printf "%s\n" "Service not running"
+                        fi
+                ;;
+                stop)
+                        printf "%-50s" "Stopping $NAME"
+                            PID=$(cat $PIDFILE)
+                        if [ -f $PIDFILE ]; then
+                            kill -HUP $PID
+                            printf "%s\n" "Ok"
+                            rm -f $PIDFILE
+                        else
+                            printf "%s\n" "pidfile not found"
+                        fi
+                ;;
+
+                restart)
+                      $0 stop
+                      $0 start
+                ;;
+
+                *)
+                        echo "Usage: $0 {status|start|stop|restart}"
+                        exit 1
+                esac
+              mode: '000755'
+              owner: root
+              group: root
+            /etc/init.d/nomad-server:
+              content: !Sub |
+                #!/bin/bash
+                # nomad-server daemon
+                # chkconfig: 345 20 80
+                # description: nomad-server daemon
+                # processname: nomad-server
+
+                DAEMON=/usr/local/bin/nomad
+
+                NAME=nomad-server
+                DESC="Nomad Server"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+
+                case "$1" in
+                start)
+                  printf "%-50s" "Starting $NAME..."
+                  DATACENTER = "${AWS::Region}"
+                  DAEMONOPTS="agent -config=/etc/nomad.d/server.hcl"
+                  touch $LOGFILE
+                  chmod 0644 $LOGFILE
+                  PID=$($DAEMON $DAEMONOPTS > $LOGFILE 2>&1 & echo $!)
+                  #echo "Saving PID" $PID " to " $PIDFILE
+                        if [ -z $PID ]; then
+                            printf "%s\n" "Fail"
+                        else
+                            echo $PID > $PIDFILE
+                            printf "%s\n" "Ok"
+                        fi
+                ;;
+                status)
+                        printf "%-50s" "Checking $NAME..."
+                        if [ -f $PIDFILE ]; then
+                            PID=$(cat $PIDFILE)
+                            if [ -z "$(ps axf | grep $PID | grep -v grep)" ]; then
+                                printf "%s\n" "Process dead but pidfile exists"
+                            else
+                                echo "Running"
+                            fi
+                        else
+                            printf "%s\n" "Service not running"
+                        fi
+                ;;
+                stop)
+                        printf "%-50s" "Stopping $NAME"
+                            PID=$(cat $PIDFILE)
+                        if [ -f $PIDFILE ]; then
+                            kill -HUP $PID
+                            printf "%s\n" "Ok"
+                            rm -f $PIDFILE
+                        else
+                            printf "%s\n" "pidfile not found"
+                        fi
+                ;;
+
+                restart)
+                      $0 stop
+                      $0 start
+                ;;
+
+                *)
+                        echo "Usage: $0 {status|start|stop|restart}"
+                        exit 1
+                esac
+              mode: '000755'
+              owner: root
+              group: root
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack = ${AWS::StackId}
+                region = ${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.ContainerInstances.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource rNomadServerLaunchConfiguration --region ${AWS::Region}
+                runas=root
+            /etc/nomad.d/server.hcl:
+              content: !Sub |
+                data_dir  = "/opt/nomad/data"
+                datacenter = "${AWS::Region}"
+                server {
+                  enabled          = true
+                  bootstrap_expect = ${pDesiredCapacity}
+                }
+              mode: '000400'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+              consul-agent:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/init.d/consul-agent
+                  - /etc/consul.d/agent-config.json
+              nomad-server:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/init.d/nomad-server
+                  - /etc/nomad.d/server.hcl
+    Properties:
+      IamInstanceProfile: !ImportValue
+        Fn::Sub: "${pNomadIAMStack}-ConsulServerMemberInstanceProfile"
+      ImageId: !Ref pNomadMemberAmiId
+      InstanceMonitoring: false
+      InstanceType: !Ref pInstanceType
+      KeyName: !Ref pKeyName
+      SecurityGroups:
+        - !Ref rSSHAccessSecurityGroup
+        - !ImportValue
+          Fn::Sub: "${pConsulServerStack}-ConsulClusterSecurityGroup"
+        - !ImportValue
+          Fn::Sub: "${pConsulServerStack}-ConsulRPCAndGossipSecurityGroup"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum install -y \
+              aws-cfn-bootstrap \
+              unzip
+
+          function error_exit
+          {
+            /opt/aws/bin/cfn-signal \
+                --success false \
+                --reason 'look on /var/log' \
+                --stack ${AWS::StackName} \
+                --resource rConsulMemberAutoScalingGroup \
+                --region ${AWS::Region}
+            exit 1
+          }
+
+          /opt/aws/bin/cfn-init -v \
+              --stack ${AWS::StackName} \
+              --resource rNomadServerLaunchConfiguration \
+              --region ${AWS::Region} || error_exit
+
+          /opt/aws/bin/cfn-signal --success true \
+              --stack ${AWS::StackName} \
+              --resource rNomadServerAutoScalingGroup \
+              --region ${AWS::Region}
+
+
+  rNomadServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ]
+      HealthCheckGracePeriod: 5
+      HealthCheckType: ELB
+      LaunchConfigurationName: !Ref rNomadServerLaunchConfiguration
+      MaxSize: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, maxMembersCapacity ]
+      MinSize: 0
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-nomad-server-asg"
+          PropagateAtLaunch: true
+        - Key: role
+          Value: nomand-server
+          PropagateAtLaunch: true
+      VPCZoneIdentifier: !Ref pSubnetIds
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ]
+        PauseTime: PT10M
+        WaitOnResourceSignals: true
+
+
+  rNomadAgentLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_install_consul_agent:
+              command: !Sub |
+                #!/bin/bash
+
+                curl -L
+                    'https://releases.hashicorp.com/consul/${pConsulAgentVersion}/consul_${pConsulAgentVersion}_linux_amd64.zip' \
+                    -o /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
+
+                mkdir -p /opt/consul/data
+                unzip \
+                    /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip \
+                    -d /opt/consul
+                rm -f /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
+
+                useradd -s /bin/false -d /opt/consul -r consul
+                chown -R consul /opt/consul
+                chmod 755 /opt/consul/consul
+
+                mkdir -p /etc/consul.d
+                ln -sf /opt/consul/consul /usr/local/bin/
+            02_install_nomand_agent:
+              command: !Sub |
+                #!/bin/bash
+
+                curl -L
+                    'https://releases.hashicorp.com/nomad/${pNomadVersion}/nomad_${pNomadVersion}_linux_amd64.zip' \
+                    -o /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
+
+                mkdir -p /opt/nomad/data
+                unzip \
+                    /tmp/nomad_${pNomadVersion}_linux_amd64.zip \
+                    -d /opt/nomad
+                rm -f /tmp/nomad_${pNomadVersion}_linux_amd64.zip
+
+                useradd -s /bin/false -d /opt/nomad -r nomad
+                chown -R consul /opt/nomad
+                chmod 755 /opt/nomad/nomad
+
+                ln -sf /opt/nomad/nomad /usr/local/bin/
+          files:
+            /etc/consul.d/agent-config.json:
+              content: !Sub |
+                {
+                  "log_level": "INFO",
+                  "server": false,
+                  "disable_update_check": true,
+                  "dns_config": {
+                    "allow_stale": true,
+                    "max_stale": "3s"
+                  },
+                  "leave_on_terminate": true
+                }
+              mode: '000444'
+              owner: root
+              group: root
+            /etc/init.d/consul-agent:
+              content: !Sub |
+                #!/bin/bash
+                # consul-agent daemon
+                # chkconfig: 345 20 80
+                # description: consul-agent daemon
+                # processname: consul-agent
+
+                DAEMON=/usr/local/bin/consul
+
+                NAME=consul-agent
+                DESC="Consul Agent"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+
+                ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+
+                case "$1" in
+                start)
+                  printf "%-50s" "Starting $NAME..."
+                  DATACENTER = "${AWS::Region}"
+                  DAEMONOPTS="agent -domain 'consul.' -advertise $ADVERTISE_IP -datacenter ${DATACENTER} -client 0.0.0.0 -data-dir /opt/consul/data -config-file /etc/consul.d/agent-config.json -rejoin -retry-join-ec2-tag-key role -retry-join-ec2-tag-value consul-leader -retry-join-ec2-region ${AWS::Region}"
+                  touch $LOGFILE
+                  chmod 0644 $LOGFILE
+                  PID=$($DAEMON $DAEMONOPTS > $LOGFILE 2>&1 & echo $!)
+                  #echo "Saving PID" $PID " to " $PIDFILE
+                        if [ -z $PID ]; then
+                            printf "%s\n" "Fail"
+                        else
+                            echo $PID > $PIDFILE
+                            printf "%s\n" "Ok"
+                        fi
+                ;;
+                status)
+                        printf "%-50s" "Checking $NAME..."
+                        if [ -f $PIDFILE ]; then
+                            PID=$(cat $PIDFILE)
+                            if [ -z "$(ps axf | grep $PID | grep -v grep)" ]; then
+                                printf "%s\n" "Process dead but pidfile exists"
+                            else
+                                echo "Running"
+                            fi
+                        else
+                            printf "%s\n" "Service not running"
+                        fi
+                ;;
+                stop)
+                        printf "%-50s" "Stopping $NAME"
+                            PID=$(cat $PIDFILE)
+                        if [ -f $PIDFILE ]; then
+                            kill -HUP $PID
+                            printf "%s\n" "Ok"
+                            rm -f $PIDFILE
+                        else
+                            printf "%s\n" "pidfile not found"
+                        fi
+                ;;
+
+                restart)
+                      $0 stop
+                      $0 start
+                ;;
+
+                *)
+                        echo "Usage: $0 {status|start|stop|restart}"
+                        exit 1
+                esac
+              mode: '000755'
+              owner: root
+              group: root
+            /etc/init.d/nomad-agent:
+              content: !Sub |
+                #!/bin/bash
+                # nomad-agent daemon
+                # chkconfig: 345 20 80
+                # description: nomad-agent daemon
+                # processname: nomad-agent
+
+                DAEMON=/usr/local/bin/nomad
+
+                NAME=nomad-agent
+                DESC="Nomad Agent"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+
+                case "$1" in
+                start)
+                  printf "%-50s" "Starting $NAME..."
+                  DAEMONOPTS="agent -config=/etc/nomad.d/agent.hcl"
+                  touch $LOGFILE
+                  chmod 0644 $LOGFILE
+                  PID=$($DAEMON $DAEMONOPTS > $LOGFILE 2>&1 & echo $!)
+                  #echo "Saving PID" $PID " to " $PIDFILE
+                        if [ -z $PID ]; then
+                            printf "%s\n" "Fail"
+                        else
+                            echo $PID > $PIDFILE
+                            printf "%s\n" "Ok"
+                        fi
+                ;;
+                status)
+                        printf "%-50s" "Checking $NAME..."
+                        if [ -f $PIDFILE ]; then
+                            PID=$(cat $PIDFILE)
+                            if [ -z "$(ps axf | grep $PID | grep -v grep)" ]; then
+                                printf "%s\n" "Process dead but pidfile exists"
+                            else
+                                echo "Running"
+                            fi
+                        else
+                            printf "%s\n" "Service not running"
+                        fi
+                ;;
+                stop)
+                        printf "%-50s" "Stopping $NAME"
+                            PID=$(cat $PIDFILE)
+                        if [ -f $PIDFILE ]; then
+                            kill -HUP $PID
+                            printf "%s\n" "Ok"
+                            rm -f $PIDFILE
+                        else
+                            printf "%s\n" "pidfile not found"
+                        fi
+                ;;
+
+                restart)
+                      $0 stop
+                      $0 start
+                ;;
+
+                *)
+                        echo "Usage: $0 {status|start|stop|restart}"
+                        exit 1
+                esac
+              mode: '000755'
+              owner: root
+              group: root
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack = ${AWS::StackId}
+                region = ${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.ContainerInstances.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource rNomadAgentLaunchConfiguration --region ${AWS::Region}
+                runas=root
+            /etc/nomad.d/agent.hcl:
+              content: !Sub |
+                data_dir  = "/opt/nomad/data"
+                datacenter = "${AWS::Region}"
+                client {
+                  enabled = true
+                }
+              mode: '000400'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+              consul-agent:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/init.d/consul-agent
+                  - /etc/consul.d/agent-config.json
+              nomad-agent:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/init.d/nomad-agent
+                  - /etc/nomad.d/agent.hcl
+    Properties:
+      IamInstanceProfile: !ImportValue
+        Fn::Sub: "${pNomadIAMStack}-ConsulServerMemberInstanceProfile"
+      ImageId: !Ref pNomadMemberAmiId
+      InstanceMonitoring: false
+      InstanceType: !Ref pInstanceType
+      KeyName: !Ref pKeyName
+      SecurityGroups:
+        - !Ref rSSHAccessSecurityGroup
+        - !ImportValue
+          Fn::Sub: "${pConsulServerStack}-ConsulClusterSecurityGroup"
+        - !ImportValue
+          Fn::Sub: "${pConsulServerStack}-ConsulRPCAndGossipSecurityGroup"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum install -y \
+              aws-cfn-bootstrap \
+              unzip
+
+          function error_exit
+          {
+            /opt/aws/bin/cfn-signal \
+                --success false \
+                --reason 'look on /var/log' \
+                --stack ${AWS::StackName} \
+                --resource rConsulMemberAutoScalingGroup \
+                --region ${AWS::Region}
+            exit 1
+          }
+
+          /opt/aws/bin/cfn-init -v \
+              --stack ${AWS::StackName} \
+              --resource rNomadAgentLaunchConfiguration \
+              --region ${AWS::Region} || error_exit
+
+          /opt/aws/bin/cfn-signal --success true \
+              --stack ${AWS::StackName} \
+              --resource rNomadServerAutoScalingGroup \
+              --region ${AWS::Region}
+
+
+  rNomadAgentAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ]
+      HealthCheckGracePeriod: 5
+      HealthCheckType: ELB
+      LaunchConfigurationName: !Ref rNomadAgentLaunchConfiguration
+      MaxSize: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, maxMembersCapacity ]
+      MinSize: 0
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-nomad-agent-asg"
+          PropagateAtLaunch: true
+        - Key: role
+          Value: nomand-agent
+          PropagateAtLaunch: true
+      VPCZoneIdentifier: !Ref pSubnetIds
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ]
+        PauseTime: PT10M
+        WaitOnResourceSignals: true
+
+
+  rSSHAccessSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for accessing nomad members by SSH
+      SecurityGroupIngress:
+        - CidrIp: !Ref pSSHAccessCIDR
+          FromPort: 22
+          IpProtocol: TCP
+          ToPort: 22
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-ssh-sg"
+      VpcId: !Ref pVpcId

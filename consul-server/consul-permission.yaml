@@ -1,0 +1,39 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Permissions needed for registering services and tasks in ecs cluster
+Resources:
+  rConsulServerMemberRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-consul-server-member-role'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: trustForEc2
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+            Effect: Allow
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}-consul-server-member-policy'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: lookingForConsulMembers
+                Action:
+                  - ec2:DescribeInstances
+                Resource: '*'
+                Effect: Allow
+
+
+  rConsulServerMemberRoleInstanceProfile:
+      Type: AWS::IAM::InstanceProfile
+      Properties:
+        Path: /
+        Roles: [ !Ref rConsulServerMemberRole ]
+
+Outputs:
+  ConsulServerMemberInstanceProfile:
+    Description: IAM role to allow consul server member to play with with aws api
+    Value: !Ref rConsulServerMemberRoleInstanceProfile
+    Export:
+      Name: !Sub '${AWS::StackName}-ConsulServerMemberInstanceProfile'

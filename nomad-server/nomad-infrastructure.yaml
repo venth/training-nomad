@@ -337,7 +337,7 @@ Resources:
               content: !Sub |
                 [cfn-auto-reloader-hook]
                 triggers=post.update
-                path=Resources.ContainerInstances.Metadata.AWS::CloudFormation::Init
+                path=Resources.rNomadServerLaunchConfiguration.Metadata.AWS::CloudFormation::Init
                 action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource rNomadServerLaunchConfiguration --region ${AWS::Region}
                 runas=root
             /etc/nomad.d/server.hcl:
@@ -652,7 +652,7 @@ Resources:
               content: !Sub |
                 [cfn-auto-reloader-hook]
                 triggers=post.update
-                path=Resources.ContainerInstances.Metadata.AWS::CloudFormation::Init
+                path=Resources.rNomadAgentLaunchConfiguration.Metadata.AWS::CloudFormation::Init
                 action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource rNomadAgentLaunchConfiguration --region ${AWS::Region}
                 runas=root
             /etc/nomad.d/agent.hcl:

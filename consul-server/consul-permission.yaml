@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: 2010-09-09
-Description: Permissions needed for registering services and tasks in ecs cluster
+Description: Permissions needed for registering consul servers by usage of AWS API
 Resources:
   rConsulServerMemberRole:
     Type: AWS::IAM::Role

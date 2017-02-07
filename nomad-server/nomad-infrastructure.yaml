@@ -7,7 +7,7 @@ Parameters:
   pKeyName:
     Type: AWS::EC2::KeyPair::KeyName
     Description: Name of an existing EC2 KeyPair to enable SSH access to the ECS instances.
-  pDesiredCapacity:
+  pDesiredServerCapacity:
     Type: Number
     Default: 3
     AllowedValues:
@@ -15,14 +15,22 @@ Parameters:
       - 5
       - 7
     Description: Number of server instances to launch in your Nomad cluster.
-  pDesiredClientCapacity:
+  pMaxServerCapacity:
+    Type: Number
+    Default: 5
+    Description: Maximal number of nomad servers
+  pDesiredAgentCapacity:
     Type: Number
     Default: 1
     Description: Number of client instances to launch in your Nomad cluster.
+  pMaxAgentCapacity:
+    Type: Number
+    Default: 2
+    Description: Maximal number of machines with nomad agents
   pInstanceType:
     Description: The EC2 instance type
     Type: String
-    Default: t2.medium
+    Default: t2.micro
     AllowedValues:
       - t2.micro
       - t2.small
@@ -77,39 +85,31 @@ Parameters:
   pConsulAgentVersion:
     Description: Version of Consul agent
     Type: String
-    Default: 0.7.1
+    Default: 0.7.3
+  pConsulClusterTagName:
+    Description: The name of the tag used to identify a role in consul cluster by value
+    Type: String
+    Default: consul-cluster-role
+  pConsulClusterTagMemberValue:
+    Description: The value of the tag used to identify member role in consul cluster
+    Type: String
+    Default: member
   pNomadVersion:
     Description: Version of Nomad agent
     Type: String
-    Default: 0.7.1
+    Default: 0.5.4
   pConsulServerStack:
     Type: String
     Description: |
       Name of the stack containing Consul Servers
       Expected exported outputs: ConsulClusterSecurityGroup, ConsulRPCAndGossipSecurityGroup
-  pNomadIAMStack:
+  pConsulIAMStack:
     Type: String
     Description: |
       Name of the stack containing IAM roles and instance profiles that can be assumed
       by ec2 instances running on this cluster.
       Expected exported outputs: ConsulServerMemberInstanceProfile
 
-
-Mappings:
-  # this mapping is used to model leader - member architecture and keep odd number of all servers
-  # in cluster.
-  # members represent desired capacity of members (note that leader can be only one)
-  # maxMembersCapacity represents space which will be used in case of rolling update
-  mDesiredCapacity:
-    '3':
-      members: 3
-      maxMembersCapacity: 4
-    '5':
-      members: 5
-      maxMembersCapacity: 6
-    '7':
-      members: 7
-      maxMembersCapacity: 8
 
 
 Rules:
@@ -134,8 +134,8 @@ Resources:
               command: !Sub |
                 #!/bin/bash
 
-                curl -L
-                    'https://releases.hashicorp.com/consul/${pConsulAgentVersion}/consul_${pConsulAgentVersion}_linux_amd64.zip' \
+                curl -L \
+                    -XGET 'https://releases.hashicorp.com/consul/${pConsulAgentVersion}/consul_${pConsulAgentVersion}_linux_amd64.zip' \
                     -o /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
 
                 mkdir -p /opt/consul/data
@@ -154,9 +154,9 @@ Resources:
               command: !Sub |
                 #!/bin/bash
 
-                curl -L
-                    'https://releases.hashicorp.com/nomad/${pNomadVersion}/nomad_${pNomadVersion}_linux_amd64.zip' \
-                    -o /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
+                curl -L \
+                    -XGET 'https://releases.hashicorp.com/nomad/${pNomadVersion}/nomad_${pNomadVersion}_linux_amd64.zip' \
+                    -o /tmp/nomad_${pNomadVersion}_linux_amd64.zip
 
                 mkdir -p /opt/nomad/data
                 unzip \
@@ -165,21 +165,41 @@ Resources:
                 rm -f /tmp/nomad_${pNomadVersion}_linux_amd64.zip
 
                 useradd -s /bin/false -d /opt/nomad -r nomad
-                chown -R consul /opt/nomad
+                chown -R nomad /opt/nomad
                 chmod 755 /opt/nomad/nomad
 
                 ln -sf /opt/nomad/nomad /usr/local/bin/
+            03_create_advertise_nomad_config:
+              command: !Sub |
+                #!/bin/bash
+
+                ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+
+                cat <<EOF > /etc/nomad.d/advertise.hcl
+                advertise {
+                  # We need to specify our host's IP because we can't
+                  # advertise 0.0.0.0 to other nodes in our cluster.
+                  http = "$ADVERTISE_IP"
+                  rpc  = "$ADVERTISE_IP"
+                  serf = "$ADVERTISE_IP"
+                }
+                EOF
+                chmod 0444 /etc/nomad.d/advertise.hcl
           files:
-            /etc/consul.d/agent-config.json:
+            /etc/consul.d/agent/config.json:
               content: !Sub |
                 {
                   "log_level": "INFO",
+                  "datacenter": "${AWS::Region}",
                   "server": false,
                   "disable_update_check": true,
+                  "data_dir": "/opt/consul/data",
                   "dns_config": {
                     "allow_stale": true,
-                    "max_stale": "3s"
+                    "max_stale": "3s",
+                    "node_ttl": "1m"
                   },
+                  "skip_leave_on_interrupt": false,
                   "leave_on_terminate": true
                 }
               mode: '000444'
@@ -187,141 +207,222 @@ Resources:
               group: root
             /etc/init.d/consul-agent:
               content: !Sub |
-                #!/bin/bash
-                # consul-agent daemon
-                # chkconfig: 345 20 80
-                # description: consul-agent daemon
-                # processname: consul-agent
+                  #!/bin/bash
+                  # consul-agent daemon
+                  # chkconfig: 345 20 80
+                  # description: consul-agent daemon
+                  # processname: consul-agent
 
-                DAEMON=/usr/local/bin/consul
+                  DAEMON=/usr/local/bin/consul
+                  DAEMON_USER=consul
 
-                NAME=consul-agent
-                DESC="Consul Agent"
-                PIDFILE=/var/run/$NAME.pid
-                LOGFILE=/var/log/$NAME.log
-                SCRIPTNAME=/etc/init.d/$NAME
+                  NAME=consul-agent
+                  DESC="Consul Agent"
+                  PIDFILE=/var/run/$NAME.pid
+                  LOGFILE=/var/log/$NAME.log
+                  SCRIPTNAME=/etc/init.d/$NAME
+                  DATACENTER="${AWS::Region}"
 
-                ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+                  ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
 
-                case "$1" in
-                start)
-                  printf "%-50s" "Starting $NAME..."
-                  DATACENTER = "${AWS::Region}"
-                  DAEMONOPTS="agent -domain 'consul.' -advertise $ADVERTISE_IP -datacenter ${DATACENTER} -client 0.0.0.0 -data-dir /opt/consul/data -config-file /etc/consul.d/agent-config.json -rejoin -retry-join-ec2-tag-key role -retry-join-ec2-tag-value consul-leader -retry-join-ec2-region ${AWS::Region}"
-                  touch $LOGFILE
-                  chmod 0644 $LOGFILE
-                  PID=$($DAEMON $DAEMONOPTS > $LOGFILE 2>&1 & echo $!)
-                  #echo "Saving PID" $PID " to " $PIDFILE
-                        if [ -z $PID ]; then
-                            printf "%s\n" "Fail"
-                        else
-                            echo $PID > $PIDFILE
-                            printf "%s\n" "Ok"
+                  DAEMON_START_OPTS="agent \
+                      -domain 'consul.' \
+                      -advertise $ADVERTISE_IP \
+                      -datacenter $DATACENTER \
+                      -client 0.0.0.0 \
+                      -data-dir /opt/consul/data \
+                      -config-file /etc/consul.d/agent/config.json \
+                      -rejoin -retry-join-ec2-tag-key ${pConsulClusterTagName} \
+                      -retry-join-ec2-tag-value ${pConsulClusterTagMemberValue} \
+                      -retry-join-ec2-region ${AWS::Region}"
+
+                  DAEMON_STOP_OPTS="leave"
+
+                  function daemon_pid {
+                    echo $(ps aux | grep "$DAEMON $DAEMON_START_OPTS" | grep -v grep | awk '{ print $2 }')
+                  }
+
+                  function start {
+                    pid=$(daemon_pid)
+                      if [ -n "$pid" ]
+                      then
+                        echo "$NAME is already running (pid: $pid)"
+                      else
+                        echo "Starting $NAME"
+                        ulimit -n 100000
+                        umask 007
+                        touch $LOGFILE
+                        chmod 0744 $LOGFILE
+                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 &
+                      fi
+
+                      return 0
+                  }
+
+                  function status {
+                    pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "$NAME is running with pid: $pid"
+                    else
+                      echo "$NAME is not running"
+                    fi
+                  }
+
+                  function stop {
+                    pid=$(daemon_pid)
+                      if [ -n "$pid" ]
+                      then
+                        echo "Stopping $NAME"
+                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+
+                        kwait=$SHUTDOWN_WAIT
+                        count=0;
+                        until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                        do
+                          echo -n -e "\nwaiting for processes to exit";
+                          sleep 1
+                          count=$count+1;
+                        done
+
+                        if [[ $count -gt $kwait ]]; then
+                          echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                          kill -9 $pid
                         fi
-                ;;
-                status)
-                        printf "%-50s" "Checking $NAME..."
-                        if [ -f $PIDFILE ]; then
-                            PID=$(cat $PIDFILE)
-                            if [ -z "$(ps axf | grep $PID | grep -v grep)" ]; then
-                                printf "%s\n" "Process dead but pidfile exists"
-                            else
-                                echo "Running"
-                            fi
-                        else
-                            printf "%s\n" "Service not running"
-                        fi
-                ;;
-                stop)
-                        printf "%-50s" "Stopping $NAME"
-                            PID=$(cat $PIDFILE)
-                        if [ -f $PIDFILE ]; then
-                            kill -HUP $PID
-                            printf "%s\n" "Ok"
-                            rm -f $PIDFILE
-                        else
-                            printf "%s\n" "pidfile not found"
-                        fi
-                ;;
+                      else
+                        echo "$NAME is not running"
+                      fi
 
-                restart)
-                      $0 stop
-                      $0 start
-                ;;
+                      return 0
+                  }
 
-                *)
-                        echo "Usage: $0 {status|start|stop|restart}"
-                        exit 1
-                esac
+                  case "$1" in
+                  start)
+                    start
+                    status
+                  ;;
+                  status)
+                    status
+                  ;;
+                  stop)
+                    stop
+                  ;;
+
+                  restart)
+                    stop
+                    start
+                  ;;
+
+                  *)
+                    echo "Usage: $0 {status|start|stop|restart}"
+                    exit 1
+                  esac
               mode: '000755'
               owner: root
               group: root
             /etc/init.d/nomad-server:
               content: !Sub |
-                #!/bin/bash
-                # nomad-server daemon
-                # chkconfig: 345 20 80
-                # description: nomad-server daemon
-                # processname: nomad-server
+                  #!/bin/bash
+                  # nomad-server daemon
+                  # chkconfig: 345 20 80
+                  # description: nomad-server daemon
+                  # processname: nomad-server
 
-                DAEMON=/usr/local/bin/nomad
+                  DAEMON=/usr/local/bin/nomad
+                  DAEMON_USER=nomad
 
-                NAME=nomad-server
-                DESC="Nomad Server"
-                PIDFILE=/var/run/$NAME.pid
-                LOGFILE=/var/log/$NAME.log
-                SCRIPTNAME=/etc/init.d/$NAME
+                  NAME=nomad-server
+                  DESC="Nomad Server"
+                  PIDFILE=/var/run/$NAME.pid
+                  LOGFILE=/var/log/$NAME.log
+                  SCRIPTNAME=/etc/init.d/$NAME
+                  DATACENTER="${AWS::Region}"
 
-                case "$1" in
-                start)
-                  printf "%-50s" "Starting $NAME..."
-                  DATACENTER = "${AWS::Region}"
-                  DAEMONOPTS="agent -config=/etc/nomad.d/server.hcl"
-                  touch $LOGFILE
-                  chmod 0644 $LOGFILE
-                  PID=$($DAEMON $DAEMONOPTS > $LOGFILE 2>&1 & echo $!)
-                  #echo "Saving PID" $PID " to " $PIDFILE
-                        if [ -z $PID ]; then
-                            printf "%s\n" "Fail"
-                        else
-                            echo $PID > $PIDFILE
-                            printf "%s\n" "Ok"
+                  DAEMON_START_OPTS="agent \
+                      -config /etc/nomad.d/server.hcl \
+                      -config /etc/nomad.d/advertise.hcl"
+
+                  DAEMON_STOP_OPTS="node-drain -self -enable -yes"
+
+                  function daemon_pid {
+                    echo $(ps aux | grep "$DAEMON $DAEMON_START_OPTS" | grep -v grep | awk '{ print $2 }')
+                  }
+
+                  function start {
+                    pid=$(daemon_pid)
+                      if [ -n "$pid" ]
+                      then
+                        echo "$NAME is already running (pid: $pid)"
+                      else
+                        echo "Starting $NAME"
+                        ulimit -n 100000
+                        umask 007
+                        touch $LOGFILE
+                        chmod 0744 $LOGFILE
+                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 &
+                      fi
+
+                      return 0
+                  }
+
+                  function status {
+                    pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "$NAME is running with pid: $pid"
+                    else
+                      echo "$NAME is not running"
+                    fi
+                  }
+
+                  function stop {
+                    pid=$(daemon_pid)
+                      if [ -n "$pid" ]
+                      then
+                        echo "Stopping $NAME"
+                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+
+                        kwait=$SHUTDOWN_WAIT
+                        count=0;
+                        until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                        do
+                          echo -n -e "\nwaiting for processes to exit";
+                          sleep 1
+                          count=$count+1;
+                        done
+
+                        if [[ $count -gt $kwait ]]; then
+                          echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                          kill -9 $pid
                         fi
-                ;;
-                status)
-                        printf "%-50s" "Checking $NAME..."
-                        if [ -f $PIDFILE ]; then
-                            PID=$(cat $PIDFILE)
-                            if [ -z "$(ps axf | grep $PID | grep -v grep)" ]; then
-                                printf "%s\n" "Process dead but pidfile exists"
-                            else
-                                echo "Running"
-                            fi
-                        else
-                            printf "%s\n" "Service not running"
-                        fi
-                ;;
-                stop)
-                        printf "%-50s" "Stopping $NAME"
-                            PID=$(cat $PIDFILE)
-                        if [ -f $PIDFILE ]; then
-                            kill -HUP $PID
-                            printf "%s\n" "Ok"
-                            rm -f $PIDFILE
-                        else
-                            printf "%s\n" "pidfile not found"
-                        fi
-                ;;
+                      else
+                        echo "$NAME is not running"
+                      fi
 
-                restart)
-                      $0 stop
-                      $0 start
-                ;;
+                      return 0
+                  }
 
-                *)
-                        echo "Usage: $0 {status|start|stop|restart}"
-                        exit 1
-                esac
+                  case "$1" in
+                  start)
+                    start
+                    status
+                  ;;
+                  status)
+                    status
+                  ;;
+                  stop)
+                    stop
+                  ;;
+
+                  restart)
+                    stop
+                    start
+                  ;;
+
+                  *)
+                    echo "Usage: $0 {status|start|stop|restart}"
+                    exit 1
+                  esac
               mode: '000755'
               owner: root
               group: root
@@ -346,9 +447,22 @@ Resources:
                 datacenter = "${AWS::Region}"
                 server {
                   enabled          = true
-                  bootstrap_expect = ${pDesiredCapacity}
+                  bootstrap_expect = ${pDesiredServerCapacity}
                 }
-              mode: '000400'
+                consul {
+                  # The address to the Consul agent.
+                  address = "127.0.0.1:8500"
+
+                  # The service name to register the server and client with Consul.
+                  server_service_name = "nomad-server"
+
+                  # Enables automatically registering the services.
+                  auto_advertise = true
+
+                  # Enabling the server to bootstrap using Consul.
+                  server_auto_join = true
+                }
+              mode: '000444'
               owner: root
               group: root
           services:
@@ -364,17 +478,18 @@ Resources:
                 ensureRunning: true
                 files:
                   - /etc/init.d/consul-agent
-                  - /etc/consul.d/agent-config.json
+                  - /etc/consul.d/agent/config.json
               nomad-server:
                 enabled: true
                 ensureRunning: true
                 files:
                   - /etc/init.d/nomad-server
                   - /etc/nomad.d/server.hcl
+                  - /etc/nomad.d/advertise.hcl
     Properties:
       IamInstanceProfile: !ImportValue
-        Fn::Sub: "${pNomadIAMStack}-ConsulServerMemberInstanceProfile"
-      ImageId: !Ref pNomadMemberAmiId
+        Fn::Sub: "${pConsulIAMStack}-ConsulServerMemberInstanceProfile"
+      ImageId: !Ref pClusterMemberAmiId
       InstanceMonitoring: false
       InstanceType: !Ref pInstanceType
       KeyName: !Ref pKeyName
@@ -384,28 +499,32 @@ Resources:
           Fn::Sub: "${pConsulServerStack}-ConsulClusterSecurityGroup"
         - !ImportValue
           Fn::Sub: "${pConsulServerStack}-ConsulRPCAndGossipSecurityGroup"
+        - !Ref rNomadClusterSecurityGroup
+        - !Ref rNomadHttpRpcSerfSecurityGroup
       UserData:
         Fn::Base64: !Sub |
-          #!/bin/bash -xe
+          #!/bin/bash
           yum install -y \
               aws-cfn-bootstrap \
-              unzip
+              unzip \
+              wget
 
-          function error_exit
-          {
+          function error_exit {
             /opt/aws/bin/cfn-signal \
                 --success false \
-                --reason 'look on /var/log' \
+                --reason "$1 - look on /var/log" \
                 --stack ${AWS::StackName} \
-                --resource rConsulMemberAutoScalingGroup \
+                --resource rNomadServerAutoScalingGroup \
                 --region ${AWS::Region}
             exit 1
           }
 
-          /opt/aws/bin/cfn-init -v \
+          trap 'error_exit "Line no: $LINENO"' ERR
+
+          /opt/aws/bin/cfn-init \
               --stack ${AWS::StackName} \
               --resource rNomadServerLaunchConfiguration \
-              --region ${AWS::Region} || error_exit
+              --region ${AWS::Region} || error_exit 'Error during initialization script'
 
           /opt/aws/bin/cfn-signal --success true \
               --stack ${AWS::StackName} \
@@ -416,11 +535,11 @@ Resources:
   rNomadServerAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
-      DesiredCapacity: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ]
+      DesiredCapacity: !Ref pDesiredServerCapacity
       HealthCheckGracePeriod: 5
-      HealthCheckType: ELB
+      HealthCheckType: EC2
       LaunchConfigurationName: !Ref rNomadServerLaunchConfiguration
-      MaxSize: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, maxMembersCapacity ]
+      MaxSize: !Ref pMaxServerCapacity
       MinSize: 0
       Tags:
         - Key: Name
@@ -435,7 +554,7 @@ Resources:
         Timeout: PT10M
     UpdatePolicy:
       AutoScalingRollingUpdate:
-        MinInstancesInService: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ]
+        MinInstancesInService: 1
         PauseTime: PT10M
         WaitOnResourceSignals: true
 
@@ -450,8 +569,8 @@ Resources:
               command: !Sub |
                 #!/bin/bash
 
-                curl -L
-                    'https://releases.hashicorp.com/consul/${pConsulAgentVersion}/consul_${pConsulAgentVersion}_linux_amd64.zip' \
+                curl -L \
+                    -XGET 'https://releases.hashicorp.com/consul/${pConsulAgentVersion}/consul_${pConsulAgentVersion}_linux_amd64.zip' \
                     -o /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
 
                 mkdir -p /opt/consul/data
@@ -470,9 +589,9 @@ Resources:
               command: !Sub |
                 #!/bin/bash
 
-                curl -L
-                    'https://releases.hashicorp.com/nomad/${pNomadVersion}/nomad_${pNomadVersion}_linux_amd64.zip' \
-                    -o /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
+                curl -L \
+                    -XGET 'https://releases.hashicorp.com/nomad/${pNomadVersion}/nomad_${pNomadVersion}_linux_amd64.zip' \
+                    -o /tmp/nomad_${pNomadVersion}_linux_amd64.zip
 
                 mkdir -p /opt/nomad/data
                 unzip \
@@ -481,21 +600,41 @@ Resources:
                 rm -f /tmp/nomad_${pNomadVersion}_linux_amd64.zip
 
                 useradd -s /bin/false -d /opt/nomad -r nomad
-                chown -R consul /opt/nomad
+                chown -R nomad /opt/nomad
                 chmod 755 /opt/nomad/nomad
 
                 ln -sf /opt/nomad/nomad /usr/local/bin/
+            03_create_advertise_nomad_config:
+              command: !Sub |
+                #!/bin/bash
+
+                ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+
+                cat <<EOF > /etc/nomad.d/advertise.hcl
+                advertise {
+                  # We need to specify our host's IP because we can't
+                  # advertise 0.0.0.0 to other nodes in our cluster.
+                  http = "$ADVERTISE_IP"
+                  rpc  = "$ADVERTISE_IP"
+                  serf = "$ADVERTISE_IP"
+                }
+                EOF
+                chmod 0444 /etc/nomad.d/advertise.hcl
           files:
-            /etc/consul.d/agent-config.json:
+            /etc/consul.d/agent/config.json:
               content: !Sub |
                 {
                   "log_level": "INFO",
+                  "datacenter": "${AWS::Region}",
                   "server": false,
                   "disable_update_check": true,
+                  "data_dir": "/opt/consul/data",
                   "dns_config": {
                     "allow_stale": true,
-                    "max_stale": "3s"
+                    "max_stale": "3s",
+                    "node_ttl": "1m"
                   },
+                  "skip_leave_on_interrupt": false,
                   "leave_on_terminate": true
                 }
               mode: '000444'
@@ -503,140 +642,222 @@ Resources:
               group: root
             /etc/init.d/consul-agent:
               content: !Sub |
-                #!/bin/bash
-                # consul-agent daemon
-                # chkconfig: 345 20 80
-                # description: consul-agent daemon
-                # processname: consul-agent
+                  #!/bin/bash
+                  # consul-agent daemon
+                  # chkconfig: 345 20 80
+                  # description: consul-agent daemon
+                  # processname: consul-agent
 
-                DAEMON=/usr/local/bin/consul
+                  DAEMON=/usr/local/bin/consul
+                  DAEMON_USER=consul
 
-                NAME=consul-agent
-                DESC="Consul Agent"
-                PIDFILE=/var/run/$NAME.pid
-                LOGFILE=/var/log/$NAME.log
-                SCRIPTNAME=/etc/init.d/$NAME
+                  NAME=consul-agent
+                  DESC="Consul Agent"
+                  PIDFILE=/var/run/$NAME.pid
+                  LOGFILE=/var/log/$NAME.log
+                  SCRIPTNAME=/etc/init.d/$NAME
+                  DATACENTER="${AWS::Region}"
 
-                ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+                  ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
 
-                case "$1" in
-                start)
-                  printf "%-50s" "Starting $NAME..."
-                  DATACENTER = "${AWS::Region}"
-                  DAEMONOPTS="agent -domain 'consul.' -advertise $ADVERTISE_IP -datacenter ${DATACENTER} -client 0.0.0.0 -data-dir /opt/consul/data -config-file /etc/consul.d/agent-config.json -rejoin -retry-join-ec2-tag-key role -retry-join-ec2-tag-value consul-leader -retry-join-ec2-region ${AWS::Region}"
-                  touch $LOGFILE
-                  chmod 0644 $LOGFILE
-                  PID=$($DAEMON $DAEMONOPTS > $LOGFILE 2>&1 & echo $!)
-                  #echo "Saving PID" $PID " to " $PIDFILE
-                        if [ -z $PID ]; then
-                            printf "%s\n" "Fail"
-                        else
-                            echo $PID > $PIDFILE
-                            printf "%s\n" "Ok"
+                  DAEMON_START_OPTS="agent \
+                      -domain 'consul.' \
+                      -advertise $ADVERTISE_IP \
+                      -datacenter $DATACENTER \
+                      -client 0.0.0.0 \
+                      -data-dir /opt/consul/data \
+                      -config-file /etc/consul.d/agent/config.json \
+                      -rejoin -retry-join-ec2-tag-key ${pConsulClusterTagName} \
+                      -retry-join-ec2-tag-value ${pConsulClusterTagMemberValue} \
+                      -retry-join-ec2-region ${AWS::Region}"
+
+                  DAEMON_STOP_OPTS="leave"
+
+                  function daemon_pid {
+                    echo $(ps aux | grep "$DAEMON $DAEMON_START_OPTS" | grep -v grep | awk '{ print $2 }')
+                  }
+
+                  function start {
+                    pid=$(daemon_pid)
+                      if [ -n "$pid" ]
+                      then
+                        echo "$NAME is already running (pid: $pid)"
+                      else
+                        echo "Starting $NAME"
+                        ulimit -n 100000
+                        umask 007
+                        touch $LOGFILE
+                        chmod 0744 $LOGFILE
+                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 &
+                      fi
+
+                      return 0
+                  }
+
+                  function status {
+                    pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "$NAME is running with pid: $pid"
+                    else
+                      echo "$NAME is not running"
+                    fi
+                  }
+
+                  function stop {
+                    pid=$(daemon_pid)
+                      if [ -n "$pid" ]
+                      then
+                        echo "Stopping $NAME"
+                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+
+                        kwait=$SHUTDOWN_WAIT
+                        count=0;
+                        until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                        do
+                          echo -n -e "\nwaiting for processes to exit";
+                          sleep 1
+                          count=$count+1;
+                        done
+
+                        if [[ $count -gt $kwait ]]; then
+                          echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                          kill -9 $pid
                         fi
-                ;;
-                status)
-                        printf "%-50s" "Checking $NAME..."
-                        if [ -f $PIDFILE ]; then
-                            PID=$(cat $PIDFILE)
-                            if [ -z "$(ps axf | grep $PID | grep -v grep)" ]; then
-                                printf "%s\n" "Process dead but pidfile exists"
-                            else
-                                echo "Running"
-                            fi
-                        else
-                            printf "%s\n" "Service not running"
-                        fi
-                ;;
-                stop)
-                        printf "%-50s" "Stopping $NAME"
-                            PID=$(cat $PIDFILE)
-                        if [ -f $PIDFILE ]; then
-                            kill -HUP $PID
-                            printf "%s\n" "Ok"
-                            rm -f $PIDFILE
-                        else
-                            printf "%s\n" "pidfile not found"
-                        fi
-                ;;
+                      else
+                        echo "$NAME is not running"
+                      fi
 
-                restart)
-                      $0 stop
-                      $0 start
-                ;;
+                      return 0
+                  }
 
-                *)
-                        echo "Usage: $0 {status|start|stop|restart}"
-                        exit 1
-                esac
+                  case "$1" in
+                  start)
+                    start
+                    status
+                  ;;
+                  status)
+                    status
+                  ;;
+                  stop)
+                    stop
+                  ;;
+
+                  restart)
+                    stop
+                    start
+                  ;;
+
+                  *)
+                    echo "Usage: $0 {status|start|stop|restart}"
+                    exit 1
+                  esac
               mode: '000755'
               owner: root
               group: root
             /etc/init.d/nomad-agent:
               content: !Sub |
-                #!/bin/bash
-                # nomad-agent daemon
-                # chkconfig: 345 20 80
-                # description: nomad-agent daemon
-                # processname: nomad-agent
+                  #!/bin/bash
+                  # nomad-agent daemon
+                  # chkconfig: 345 20 80
+                  # description: nomad-agent daemon
+                  # processname: nomad-agent
 
-                DAEMON=/usr/local/bin/nomad
+                  DAEMON=/usr/local/bin/nomad
+                  DAEMON_USER=nomad
 
-                NAME=nomad-agent
-                DESC="Nomad Agent"
-                PIDFILE=/var/run/$NAME.pid
-                LOGFILE=/var/log/$NAME.log
-                SCRIPTNAME=/etc/init.d/$NAME
+                  NAME=nomad-agent
+                  DESC="Nomad Agent"
+                  PIDFILE=/var/run/$NAME.pid
+                  LOGFILE=/var/log/$NAME.log
+                  SCRIPTNAME=/etc/init.d/$NAME
+                  DATACENTER="${AWS::Region}"
 
-                case "$1" in
-                start)
-                  printf "%-50s" "Starting $NAME..."
-                  DAEMONOPTS="agent -config=/etc/nomad.d/agent.hcl"
-                  touch $LOGFILE
-                  chmod 0644 $LOGFILE
-                  PID=$($DAEMON $DAEMONOPTS > $LOGFILE 2>&1 & echo $!)
-                  #echo "Saving PID" $PID " to " $PIDFILE
-                        if [ -z $PID ]; then
-                            printf "%s\n" "Fail"
-                        else
-                            echo $PID > $PIDFILE
-                            printf "%s\n" "Ok"
+                  DAEMON_START_OPTS="agent \
+                      -config /etc/nomad.d/agent.hcl \
+                      -config /etc/nomad.d/advertise.hcl"
+
+                  DAEMON_STOP_OPTS="node-drain -self -enable -yes"
+
+                  function daemon_pid {
+                    echo $(ps aux | grep "$DAEMON $DAEMON_START_OPTS" | grep -v grep | awk '{ print $2 }')
+                  }
+
+                  function start {
+                    pid=$(daemon_pid)
+                      if [ -n "$pid" ]
+                      then
+                        echo "$NAME is already running (pid: $pid)"
+                      else
+                        echo "Starting $NAME"
+                        ulimit -n 100000
+                        umask 007
+                        touch $LOGFILE
+                        chmod 0744 $LOGFILE
+                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 &
+                      fi
+
+                      return 0
+                  }
+
+                  function status {
+                    pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "$NAME is running with pid: $pid"
+                    else
+                      echo "$NAME is not running"
+                    fi
+                  }
+
+                  function stop {
+                    pid=$(daemon_pid)
+                      if [ -n "$pid" ]
+                      then
+                        echo "Stopping $NAME"
+                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+
+                        kwait=$SHUTDOWN_WAIT
+                        count=0;
+                        until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                        do
+                          echo -n -e "\nwaiting for processes to exit";
+                          sleep 1
+                          count=$count+1;
+                        done
+
+                        if [[ $count -gt $kwait ]]; then
+                          echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                          kill -9 $pid
                         fi
-                ;;
-                status)
-                        printf "%-50s" "Checking $NAME..."
-                        if [ -f $PIDFILE ]; then
-                            PID=$(cat $PIDFILE)
-                            if [ -z "$(ps axf | grep $PID | grep -v grep)" ]; then
-                                printf "%s\n" "Process dead but pidfile exists"
-                            else
-                                echo "Running"
-                            fi
-                        else
-                            printf "%s\n" "Service not running"
-                        fi
-                ;;
-                stop)
-                        printf "%-50s" "Stopping $NAME"
-                            PID=$(cat $PIDFILE)
-                        if [ -f $PIDFILE ]; then
-                            kill -HUP $PID
-                            printf "%s\n" "Ok"
-                            rm -f $PIDFILE
-                        else
-                            printf "%s\n" "pidfile not found"
-                        fi
-                ;;
+                      else
+                        echo "$NAME is not running"
+                      fi
 
-                restart)
-                      $0 stop
-                      $0 start
-                ;;
+                      return 0
+                  }
 
-                *)
-                        echo "Usage: $0 {status|start|stop|restart}"
-                        exit 1
-                esac
+                  case "$1" in
+                  start)
+                    start
+                    status
+                  ;;
+                  status)
+                    status
+                  ;;
+                  stop)
+                    stop
+                  ;;
+
+                  restart)
+                    stop
+                    start
+                  ;;
+
+                  *)
+                    echo "Usage: $0 {status|start|stop|restart}"
+                    exit 1
+                  esac
               mode: '000755'
               owner: root
               group: root
@@ -662,7 +883,20 @@ Resources:
                 client {
                   enabled = true
                 }
-              mode: '000400'
+                consul {
+                  # The address to the Consul agent.
+                  address = "127.0.0.1:8500"
+
+                  # The service name to register the server and client with Consul.
+                  client_service_name = "nomad-client"
+
+                  # Enables automatically registering the services.
+                  auto_advertise = true
+
+                  # Enabling client to bootstrap using Consul.
+                  client_auto_join = true
+                }
+              mode: '000444'
               owner: root
               group: root
           services:
@@ -678,17 +912,18 @@ Resources:
                 ensureRunning: true
                 files:
                   - /etc/init.d/consul-agent
-                  - /etc/consul.d/agent-config.json
+                  - /etc/consul.d/agent/config.json
               nomad-agent:
                 enabled: true
                 ensureRunning: true
                 files:
                   - /etc/init.d/nomad-agent
                   - /etc/nomad.d/agent.hcl
+                  - /etc/nomad.d/advertise.hcl
     Properties:
       IamInstanceProfile: !ImportValue
-        Fn::Sub: "${pNomadIAMStack}-ConsulServerMemberInstanceProfile"
-      ImageId: !Ref pNomadMemberAmiId
+        Fn::Sub: "${pConsulIAMStack}-ConsulServerMemberInstanceProfile"
+      ImageId: !Ref pClusterMemberAmiId
       InstanceMonitoring: false
       InstanceType: !Ref pInstanceType
       KeyName: !Ref pKeyName
@@ -698,43 +933,47 @@ Resources:
           Fn::Sub: "${pConsulServerStack}-ConsulClusterSecurityGroup"
         - !ImportValue
           Fn::Sub: "${pConsulServerStack}-ConsulRPCAndGossipSecurityGroup"
+        - !Ref rNomadClusterSecurityGroup
+        - !Ref rNomadHttpRpcSerfSecurityGroup
       UserData:
         Fn::Base64: !Sub |
-          #!/bin/bash -xe
+          #!/bin/bash
           yum install -y \
               aws-cfn-bootstrap \
-              unzip
+              unzip \
+              wget
 
-          function error_exit
-          {
+          function error_exit {
             /opt/aws/bin/cfn-signal \
                 --success false \
-                --reason 'look on /var/log' \
+                --reason "$1 - look on /var/log" \
                 --stack ${AWS::StackName} \
-                --resource rConsulMemberAutoScalingGroup \
+                --resource rNomadAgentAutoScalingGroup \
                 --region ${AWS::Region}
             exit 1
           }
 
-          /opt/aws/bin/cfn-init -v \
+          trap 'error_exit "Line no: $LINENO"' ERR
+
+          /opt/aws/bin/cfn-init \
               --stack ${AWS::StackName} \
               --resource rNomadAgentLaunchConfiguration \
-              --region ${AWS::Region} || error_exit
+              --region ${AWS::Region} || error_exit 'Error during initialization script'
 
           /opt/aws/bin/cfn-signal --success true \
               --stack ${AWS::StackName} \
-              --resource rNomadServerAutoScalingGroup \
+              --resource rNomadAgentAutoScalingGroup \
               --region ${AWS::Region}
 
 
   rNomadAgentAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
-      DesiredCapacity: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ]
+      DesiredCapacity: !Ref pDesiredAgentCapacity
       HealthCheckGracePeriod: 5
-      HealthCheckType: ELB
+      HealthCheckType: EC2
       LaunchConfigurationName: !Ref rNomadAgentLaunchConfiguration
-      MaxSize: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, maxMembersCapacity ]
+      MaxSize: !Ref pMaxAgentCapacity
       MinSize: 0
       Tags:
         - Key: Name
@@ -749,7 +988,7 @@ Resources:
         Timeout: PT10M
     UpdatePolicy:
       AutoScalingRollingUpdate:
-        MinInstancesInService: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ]
+        MinInstancesInService: 1
         PauseTime: PT10M
         WaitOnResourceSignals: true
 
@@ -766,4 +1005,27 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub "${pResourceNamePrefix}-ssh-sg"
+      VpcId: !Ref pVpcId
+
+  rNomadClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Marking group of consul members to allow bi-directional communication between members. It can be used in conjuction with rNomadHttpRpcSerfSecurityGroup to enable http, rpc, serf
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-nomad-cluster-sg"
+      VpcId: !Ref pVpcId
+
+  rNomadHttpRpcSerfSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allows Http, rpc and serf calls among nomand cluster members
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref rNomadClusterSecurityGroup
+          FromPort: 4646
+          IpProtocol: TCP
+          ToPort: 4648
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-nomad-gossip-sg"
       VpcId: !Ref pVpcId

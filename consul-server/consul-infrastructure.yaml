@@ -14,7 +14,11 @@ Parameters:
       - 3
       - 5
       - 7
-    Description: Number of member instances to launch in your Consul cluster. Note that the cluster always have one leader apart from the members
+    Description: Number of member instances to launch in your Consul cluster
+  pMaxCapacity:
+    Type: Number
+    Default: 5
+    Description: Maximal number of member instances to launch in your Consul cluster
   pInstanceType:
     Description: The EC2 instance type
     Type: String
@@ -71,21 +75,17 @@ Parameters:
     Type: String
     AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/([0-9]|[1-2][0-9]|3[0-2]))$"
   pHTTPAccessCIDR:
-    Description: IP adresses allowed to access Consul cluster UI
+    Description: IP adresses allowed to access Consul cluster UI and Http API
     Type: String
     AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/([0-9]|[1-2][0-9]|3[0-2]))$"
   pConsulClusterTagName:
     Description: The name of the tag used to identify a role in consul cluster by value
     Type: String
     Default: consul-cluster-role
-  pConsulClusterTagLeaderValue:
-    Description: The value of the tag used to identify leader role in consul cluster
-    Type: String
-    Default: leader
   pConsulClusterTagMemberValue:
     Description: The value of the tag used to identify member role in consul cluster
     Type: String
-    Default: member
+    Default: server
   pConsulVersion:
     Description: Version of consul server
     Type: String
@@ -96,23 +96,6 @@ Parameters:
       Name of the stack containing IAM roles and instance profiles that can be assumed
       by container instances in ecs cluster and services / tasks running on this cluster.
       Expected exported outputs: ConsulServerMemberInstanceProfile
-
-
-Mappings:
-  # this mapping is used to model leader - member architecture and keep odd number of all servers
-  # in cluster.
-  # members represent desired capacity of members (note that leader can be only one)
-  # maxMembersCapacity represents space which will be used in case of rolling update
-  mDesiredCapacity:
-    '3':
-      members: 2
-      maxMembersCapacity: 4
-    '5':
-      members: 4
-      maxMembersCapacity: 6
-    '7':
-      members: 6
-      maxMembersCapacity: 8
 
 
 Rules:
@@ -127,296 +110,6 @@ Rules:
 
 
 Resources:
-  rConsulLeaderLaunchConfiguration:
-    Type: AWS::AutoScaling::LaunchConfiguration
-    Metadata:
-      AWS::CloudFormation::Init:
-        config:
-          commands:
-            01_install_consul:
-              command: !Sub |
-                #!/bin/bash
-                mkdir /tmp/bin
-                cd /tmp/bin
-                wget https://releases.hashicorp.com/consul/${pConsulVersion}/consul_${pConsulVersion}_linux_amd64.zip
-                wget https://releases.hashicorp.com/consul/${pConsulVersion}/consul_${pConsulVersion}_web_ui.zip
-                unzip consul_${pConsulVersion}_web_ui.zip
-                unzip consul_${pConsulVersion}_linux_amd64.zip
-                rm -f ./*.zip
-
-                mkdir -p /var/consul/data
-                mkdir -p /var/consul/www
-                mkdir -p /home/consul
-
-                useradd -s /bin/false -d /home/consul -r consul
-                chown -R consul /home/consul
-                chown -R consul /var/consul
-
-                mkdir -p /etc/consul.d/{server,bootstrap}
-                mv consul /usr/local/bin/
-                chmod 755 /usr/local/bin/consul
-                mv index.html /var/consul/www/
-                mv static/ /var/consul/www/
-
-                # Add consul user to sudoers and disable tty
-                echo "consul ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
-                echo "Defaults:%consul !requiretty" >> /etc/sudoers
-                echo "Defaults:consul !requiretty" >> /etc/sudoers
-          files:
-            /etc/consul.d/server/config.json:
-              content: !Sub |
-                {
-                  "log_level": "INFO",
-                  "datacenter": "${AWS::Region}",
-                  "server": true,
-                  "disable_update_check": true,
-                  "dns_config": {
-                    "allow_stale": true,
-                    "max_stale": "3s",
-                    "node_ttl": "1m"
-                  },
-                  "skip_leave_on_interrupt": false,
-                  "leave_on_terminate": true
-                }
-              mode: '000444'
-              owner: root
-              group: root
-            /etc/init.d/consul-server:
-              content: !Sub
-                - |
-                  #!/bin/bash
-                  # consul-server daemon
-                  # chkconfig: 345 20 80
-                  # description: consul-server daemon
-                  # processname: consul-server
-
-                  DAEMON=/usr/local/bin/consul
-                  DAEMON_USER=consul
-
-                  NAME=consul-server
-                  DESC="Consul Server Member"
-                  PIDFILE=/var/run/$NAME.pid
-                  LOGFILE=/var/log/$NAME.log
-                  SCRIPTNAME=/etc/init.d/$NAME
-                  DATACENTER="${AWS::Region}"
-
-                  ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
-
-                  DAEMON_START_OPTS="agent \
-                      -domain 'consul.' \
-                      -advertise $ADVERTISE_IP \
-                      -ui \
-                      -server \
-                      -datacenter $DATACENTER \
-                      -client 0.0.0.0 \
-                      -bootstrap-expect ${vDesiredMembersCapacity} \
-                      -data-dir /var/consul/data \
-                      -ui-dir /var/consul/www \
-                      -config-file /etc/consul.d/server/config.json \
-                      -rejoin -retry-join-ec2-tag-key ${pConsulClusterTagName} \
-                      -retry-join-ec2-tag-value ${pConsulClusterTagMemberValue} \
-                      -retry-join-ec2-region ${AWS::Region}"
-
-                  DAEMON_STOP_OPTS="leave"
-
-                  function daemon_pid {
-                    echo $(ps aux | grep "$DAEMON $DAEMON_START_OPTS" | grep -v grep | awk '{ print $2 }')
-                  }
-
-                  function start {
-                    pid=$(daemon_pid)
-                      if [ -n "$pid" ]
-                      then
-                        echo "$NAME is already running (pid: $pid)"
-                      else
-                        echo "Starting $NAME"
-                        ulimit -n 100000
-                        umask 007
-                        touch $LOGFILE
-                        chmod 0744 $LOGFILE
-                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 &
-                      fi
-
-                      return 0
-                  }
-
-                  function status {
-                    pid=$(daemon_pid)
-                    if [ -n "$pid" ]
-                    then
-                      echo "$NAME is running with pid: $pid"
-                    else
-                      echo "$NAME is not running"
-                    fi
-                  }
-
-                  function stop {
-                    pid=$(daemon_pid)
-                      if [ -n "$pid" ]
-                      then
-                        echo "Stopping $NAME"
-                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
-
-                        kwait=$SHUTDOWN_WAIT
-                        count=0;
-                        until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
-                        do
-                          echo -n -e "\nwaiting for processes to exit";
-                          sleep 1
-                          count=$count+1;
-                        done
-
-                        if [[ $count -gt $kwait ]]; then
-                          echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
-                          kill -9 $pid
-                        fi
-                      else
-                        echo "$NAME is not running"
-                      fi
-
-                      return 0
-                  }
-
-                  case "$1" in
-                  start)
-                    start
-                    status
-                  ;;
-                  status)
-                    status
-                  ;;
-                  stop)
-                    stop
-                  ;;
-
-                  restart)
-                    stop
-                    start
-                  ;;
-
-                  *)
-                    echo "Usage: $0 {status|start|stop|restart}"
-                    exit 1
-                  esac
-                - { vDesiredMembersCapacity: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ] }
-              mode: '000755'
-              owner: root
-              group: root
-            /etc/cfn/cfn-hup.conf:
-              content: !Sub |
-                [main]
-                stack = ${AWS::StackId}
-                region = ${AWS::Region}
-              mode: '000400'
-              owner: root
-              group: root
-            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
-              content: !Sub |
-                [cfn-auto-reloader-hook]
-                triggers=post.update
-                path=Resources.rConsulLeaderLaunchConfiguration.Metadata.AWS::CloudFormation::Init
-                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource rConsulLeaderLaunchConfiguration --region ${AWS::Region}
-                runas=root
-          services:
-            sysvinit:
-              cfn-hup:
-                enabled: true
-                ensureRunning: true
-                files:
-                  - /etc/cfn/cfn-hup.conf
-                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
-              consul-server:
-                enabled: true
-                ensureRunning: true
-                files:
-                  - /etc/init.d/consul-server
-                  - /etc/consul.d/server/config.json
-    Properties:
-      IamInstanceProfile: !ImportValue
-        Fn::Sub: "${pConsulIAMStack}-ConsulServerMemberInstanceProfile"
-      ImageId: !Ref pClusterMemberAmiId
-      InstanceMonitoring: false
-      InstanceType: !Ref pInstanceType
-      KeyName: !Ref pKeyName
-      SecurityGroups:
-        - !Ref rSSHAccessSecurityGroup
-        - !Ref rConsulClusterSecurityGroup
-        - !Ref rConsulRPCAndGossipSecurityGroup
-        - !Ref rConsulHTTPSecurityGroup
-      UserData:
-        Fn::Base64: !Sub |
-          #!/bin/bash
-          yum install -y \
-              aws-cfn-bootstrap \
-              unzip \
-              wget
-
-          function error_exit {
-            /opt/aws/bin/cfn-signal \
-                --success false \
-                --reason "$1 - look on /var/log" \
-                --stack ${AWS::StackName} \
-                --resource rConsulLeaderAutoScalingGroup \
-                --region ${AWS::Region}
-            exit 1
-          }
-
-          trap 'error_exit "Line no: $LINENO"' ERR
-
-          /opt/aws/bin/cfn-init \
-              --stack ${AWS::StackName} \
-              --resource rConsulLeaderLaunchConfiguration \
-              --region ${AWS::Region} || error_exit 'Error during initialization script'
-
-          IP=$(ip addr show dev eth0|awk '/inet /{print $2}'|cut -d/ -f1)
-          NEXT_WAIT_TIME=0
-          OTHER_MEMBERS_ONLINE=$(echo "$(curl -s http://localhost:8500/v1/status/peers | grep -c $IP:)")
-          while [ "$OTHER_MEMBERS_ONLINE" -eq "0" ] && [ $NEXT_WAIT_TIME -le 20 ]; do
-            echo "Waiting for consul"
-            sleep $(( NEXT_WAIT_TIME++ ))
-            OTHER_MEMBERS_ONLINE=$(echo "$(curl -s http://localhost:8500/v1/status/peers | grep -c $IP:)")
-          done
-
-          if [ "$OTHER_MEMBERS_ONLINE" -eq "0" ]; then
-            error_exit 'timeout occurred during waiting for consul servers'
-          fi
-
-          /opt/aws/bin/cfn-signal --success true \
-              --stack ${AWS::StackName} \
-              --resource rConsulLeaderAutoScalingGroup \
-              --region ${AWS::Region}
-
-
-  rConsulLeaderAutoScalingGroup:
-    Type: AWS::AutoScaling::AutoScalingGroup
-    Properties:
-      DesiredCapacity: 1
-      HealthCheckGracePeriod: 5
-      HealthCheckType: ELB
-      LoadBalancerNames:
-        - !Ref rConsulLoadBalancer
-      LaunchConfigurationName: !Ref rConsulLeaderLaunchConfiguration
-      MaxSize: 2
-      MinSize: 0
-      Tags:
-        - Key: Name
-          Value: !Sub "${pResourceNamePrefix}-leader-asg"
-          PropagateAtLaunch: true
-        - Key: !Ref pConsulClusterTagName
-          Value: !Ref pConsulClusterTagLeaderValue
-          PropagateAtLaunch: true
-      VPCZoneIdentifier: !Ref "pSubnetIds"
-    CreationPolicy:
-      ResourceSignal:
-        Timeout: PT10M
-    UpdatePolicy:
-      AutoScalingRollingUpdate:
-        MinInstancesInService: 1
-        PauseTime: PT10M
-        WaitOnResourceSignals: true
-
-
-
   rConsulMemberLaunchConfiguration:
     Type: AWS::AutoScaling::LaunchConfiguration
     Metadata:
@@ -473,123 +166,131 @@ Resources:
               owner: root
               group: root
             /etc/init.d/consul-server:
-              content: !Sub
-                - |
-                  #!/bin/bash
-                  # consul-server daemon
-                  # chkconfig: 345 20 80
-                  # description: consul-server daemon
-                  # processname: consul-server
+              content: !Sub |
+                #!/bin/bash
+                # consul-server daemon
+                # chkconfig: 345 20 80
+                # description: consul-server daemon
+                # processname: consul-server
 
-                  DAEMON=/usr/local/bin/consul
-                  DAEMON_USER=consul
+                DAEMON=/usr/local/bin/consul
+                DAEMON_USER=consul
 
-                  NAME=consul-server
-                  DESC="Consul Server Member"
-                  PIDFILE=/var/run/$NAME.pid
-                  LOGFILE=/var/log/$NAME.log
-                  SCRIPTNAME=/etc/init.d/$NAME
-                  DATACENTER="${AWS::Region}"
+                SHUTDOWN_WAIT=20
 
-                  ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+                NAME=consul-server
+                DESC="Consul Server Member"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+                DATACENTER="${AWS::Region}"
 
-                  DAEMON_START_OPTS="agent \
-                      -domain 'consul.' \
-                      -advertise $ADVERTISE_IP \
-                      -ui \
-                      -server \
-                      -datacenter $DATACENTER \
-                      -client 0.0.0.0 \
-                      -bootstrap-expect ${vDesiredMembersCapacity} \
-                      -data-dir /var/consul/data \
-                      -ui-dir /var/consul/www \
-                      -config-file /etc/consul.d/server/config.json \
-                      -rejoin -retry-join-ec2-tag-key ${pConsulClusterTagName} \
-                      -retry-join-ec2-tag-value ${pConsulClusterTagMemberValue} \
-                      -retry-join-ec2-region ${AWS::Region}"
+                ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
 
-                  DAEMON_STOP_OPTS="leave"
+                DAEMON_START_OPTS="agent \
+                    -domain 'consul.' \
+                    -advertise $ADVERTISE_IP \
+                    -ui \
+                    -server \
+                    -datacenter $DATACENTER \
+                    -client 0.0.0.0 \
+                    -bootstrap-expect ${pDesiredCapacity} \
+                    -data-dir /var/consul/data \
+                    -ui-dir /var/consul/www \
+                    -config-file /etc/consul.d/server/config.json \
+                    -rejoin -retry-join-ec2-tag-key ${pConsulClusterTagName} \
+                    -retry-join-ec2-tag-value ${pConsulClusterTagMemberValue} \
+                    -retry-join-ec2-region ${AWS::Region}"
 
-                  function daemon_pid {
-                    echo $(ps aux | grep "$DAEMON $DAEMON_START_OPTS" | grep -v grep | awk '{ print $2 }')
-                  }
+                DAEMON_STOP_OPTS="leave"
 
-                  function start {
-                    pid=$(daemon_pid)
-                      if [ -n "$pid" ]
-                      then
-                        echo "$NAME is already running (pid: $pid)"
-                      else
-                        echo "Starting $NAME"
-                        ulimit -n 100000
-                        umask 007
-                        touch $LOGFILE
-                        chmod 0744 $LOGFILE
-                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 &
-                      fi
+                function daemon_pid {
+                  cat $PIDFILE 2> /dev/null
+                }
 
-                      return 0
-                  }
-
-                  function status {
-                    pid=$(daemon_pid)
+                function start {
+                  pid=$(daemon_pid)
                     if [ -n "$pid" ]
                     then
-                      echo "$NAME is running with pid: $pid"
+                      echo "$NAME is already running (pid: $pid)"
+                    else
+                      echo "Starting $NAME"
+                      ulimit -n 100000
+                      umask 007
+                      touch $LOGFILE
+                      chmod 0644 $LOGFILE
+                      PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                      if [ -z $PID ]; then
+                          printf "%s\n" "Fail"
+                      else
+                          echo $PID > $PIDFILE
+                          printf "%s\n" "OK"
+                      fi
+                    fi
+
+                    return 0
+                }
+
+                function status {
+                  pid=$(daemon_pid)
+                  if [ -n "$pid" ]
+                  then
+                    echo "$NAME is running with pid: $pid"
+                  else
+                    echo "$NAME is not running"
+                  fi
+                }
+
+                function stop {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "Stopping $NAME"
+                      /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+
+                      kwait=$SHUTDOWN_WAIT
+                      count=0;
+                      until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                      do
+                        echo -n -e "\nwaiting for processes to exit";
+                        sleep 1
+                        count=$count+1;
+                      done
+
+                      if [[ $count -gt $kwait ]]; then
+                        echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                        kill -9 $pid
+                      fi
+                      rm -f $PIDFILE
+                      echo "Stopped"
                     else
                       echo "$NAME is not running"
                     fi
-                  }
 
-                  function stop {
-                    pid=$(daemon_pid)
-                      if [ -n "$pid" ]
-                      then
-                        echo "Stopping $NAME"
-                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+                    return 0
+                }
 
-                        kwait=$SHUTDOWN_WAIT
-                        count=0;
-                        until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
-                        do
-                          echo -n -e "\nwaiting for processes to exit";
-                          sleep 1
-                          count=$count+1;
-                        done
+                case "$1" in
+                start)
+                  start
+                  status
+                ;;
+                status)
+                  status
+                ;;
+                stop)
+                  stop
+                ;;
 
-                        if [[ $count -gt $kwait ]]; then
-                          echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
-                          kill -9 $pid
-                        fi
-                      else
-                        echo "$NAME is not running"
-                      fi
+                restart)
+                  stop
+                  start
+                ;;
 
-                      return 0
-                  }
-
-                  case "$1" in
-                  start)
-                    start
-                    status
-                  ;;
-                  status)
-                    status
-                  ;;
-                  stop)
-                    stop
-                  ;;
-
-                  restart)
-                    stop
-                    start
-                  ;;
-
-                  *)
-                    echo "Usage: $0 {status|start|stop|restart}"
-                    exit 1
-                  esac
-                - { vDesiredMembersCapacity: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ] }
+                *)
+                  echo "Usage: $0 {status|start|stop|restart}"
+                  exit 1
+                esac
               mode: '000755'
               owner: root
               group: root
@@ -681,13 +382,13 @@ Resources:
   rConsulMemberAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
-      DesiredCapacity: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ]
+      DesiredCapacity: !Ref pDesiredCapacity
       HealthCheckGracePeriod: 5
       HealthCheckType: ELB
       LaunchConfigurationName: !Ref rConsulMemberLaunchConfiguration
       LoadBalancerNames:
         - !Ref rConsulLoadBalancer
-      MaxSize: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, maxMembersCapacity ]
+      MaxSize: !Ref pMaxCapacity
       MinSize: 0
       Tags:
         - Key: Name
@@ -702,7 +403,7 @@ Resources:
         Timeout: PT10M
     UpdatePolicy:
       AutoScalingRollingUpdate:
-        MinInstancesInService: !FindInMap [ mDesiredCapacity, !Ref pDesiredCapacity, members ]
+        MinInstancesInService: 1
         PauseTime: PT10M
         WaitOnResourceSignals: true
 
@@ -753,6 +454,10 @@ Resources:
           FromPort: 8600
           IpProtocol: UDP
           ToPort: 8600
+        - CidrIp: !Ref pHTTPAccessCIDR
+          FromPort: 8500
+          IpProtocol: TCP
+          ToPort: 8500
       Tags:
         - Key: Name
           Value: !Sub "${pResourceNamePrefix}-consul-gossip-sg"

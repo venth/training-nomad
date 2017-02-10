@@ -82,6 +82,10 @@ Parameters:
     Description: IP adresses allowed ssh access to Nomad cluster members machines
     Type: String
     AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/([0-9]|[1-2][0-9]|3[0-2]))$"
+  pNomandServerAccessCIDR:
+    Description: IP adresses allowed access to Nomad cluster members machines
+    Type: String
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/([0-9]|[1-2][0-9]|3[0-2]))$"
   pConsulAgentVersion:
     Description: Version of Consul agent
     Type: String
@@ -93,7 +97,7 @@ Parameters:
   pConsulClusterTagMemberValue:
     Description: The value of the tag used to identify member role in consul cluster
     Type: String
-    Default: member
+    Default: server
   pNomadVersion:
     Description: Version of Nomad agent
     Type: String
@@ -216,6 +220,8 @@ Resources:
                   DAEMON=/usr/local/bin/consul
                   DAEMON_USER=consul
 
+                  SHUTDOWN_WAIT=20
+
                   NAME=consul-agent
                   DESC="Consul Agent"
                   PIDFILE=/var/run/$NAME.pid
@@ -239,7 +245,7 @@ Resources:
                   DAEMON_STOP_OPTS="leave"
 
                   function daemon_pid {
-                    echo $(ps aux | grep "$DAEMON $DAEMON_START_OPTS" | grep -v grep | awk '{ print $2 }')
+                    cat $PIDFILE 2> /dev/null
                   }
 
                   function start {
@@ -252,8 +258,14 @@ Resources:
                         ulimit -n 100000
                         umask 007
                         touch $LOGFILE
-                        chmod 0744 $LOGFILE
-                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 &
+                        chmod 0644 $LOGFILE
+                        PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                        if [ -z $PID ]; then
+                            printf "%s\n" "Fail"
+                        else
+                            echo $PID > $PIDFILE
+                            printf "%s\n" "OK"
+                        fi
                       fi
 
                       return 0
@@ -289,6 +301,9 @@ Resources:
                           echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
                           kill -9 $pid
                         fi
+
+                        rm -f $PIDFILE
+                        echo "Stopped"
                       else
                         echo "$NAME is not running"
                       fi
@@ -331,6 +346,8 @@ Resources:
                   DAEMON=/usr/local/bin/nomad
                   DAEMON_USER=nomad
 
+                  SHUTDOWN_WAIT=20
+
                   NAME=nomad-server
                   DESC="Nomad Server"
                   PIDFILE=/var/run/$NAME.pid
@@ -342,10 +359,8 @@ Resources:
                       -config /etc/nomad.d/server.hcl \
                       -config /etc/nomad.d/advertise.hcl"
 
-                  DAEMON_STOP_OPTS="node-drain -self -enable -yes"
-
                   function daemon_pid {
-                    echo $(ps aux | grep "$DAEMON $DAEMON_START_OPTS" | grep -v grep | awk '{ print $2 }')
+                    cat $PIDFILE 2> /dev/null
                   }
 
                   function start {
@@ -358,8 +373,14 @@ Resources:
                         ulimit -n 100000
                         umask 007
                         touch $LOGFILE
-                        chmod 0744 $LOGFILE
-                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 &
+                        chmod 0644 $LOGFILE
+                        PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                        if [ -z $PID ]; then
+                            printf "%s\n" "Fail"
+                        else
+                            echo $PID > $PIDFILE
+                            printf "%s\n" "OK"
+                        fi
                       fi
 
                       return 0
@@ -380,7 +401,8 @@ Resources:
                       if [ -n "$pid" ]
                       then
                         echo "Stopping $NAME"
-                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+
+                        kill $pid 2>&1
 
                         kwait=$SHUTDOWN_WAIT
                         count=0;
@@ -395,6 +417,9 @@ Resources:
                           echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
                           kill -9 $pid
                         fi
+
+                        rm -f $PIDFILE
+                        echo "Stopped"
                       else
                         echo "$NAME is not running"
                       fi
@@ -453,15 +478,15 @@ Resources:
                   # The address to the Consul agent.
                   address = "127.0.0.1:8500"
 
-                  # The service name to register the server and client with Consul.
                   server_service_name = "nomad-server"
+                  client_service_name = "nomad-client"
 
                   # Enables automatically registering the services.
                   auto_advertise = true
-
-                  # Enabling the server to bootstrap using Consul.
-                  server_auto_join = true
                 }
+
+                leave_on_interrupt = true
+                leave_on_terminate = true
               mode: '000444'
               owner: root
               group: root
@@ -539,6 +564,8 @@ Resources:
       HealthCheckGracePeriod: 5
       HealthCheckType: EC2
       LaunchConfigurationName: !Ref rNomadServerLaunchConfiguration
+      LoadBalancerNames:
+        - !Ref rNomadLoadBalancer
       MaxSize: !Ref pMaxServerCapacity
       MinSize: 0
       Tags:
@@ -599,8 +626,6 @@ Resources:
                     -d /opt/nomad
                 rm -f /tmp/nomad_${pNomadVersion}_linux_amd64.zip
 
-                useradd -s /bin/false -d /opt/nomad -r nomad
-                chown -R nomad /opt/nomad
                 chmod 755 /opt/nomad/nomad
 
                 ln -sf /opt/nomad/nomad /usr/local/bin/
@@ -651,6 +676,8 @@ Resources:
                   DAEMON=/usr/local/bin/consul
                   DAEMON_USER=consul
 
+                  SHUTDOWN_WAIT=20
+
                   NAME=consul-agent
                   DESC="Consul Agent"
                   PIDFILE=/var/run/$NAME.pid
@@ -674,7 +701,7 @@ Resources:
                   DAEMON_STOP_OPTS="leave"
 
                   function daemon_pid {
-                    echo $(ps aux | grep "$DAEMON $DAEMON_START_OPTS" | grep -v grep | awk '{ print $2 }')
+                    cat $PIDFILE 2> /dev/null
                   }
 
                   function start {
@@ -687,8 +714,14 @@ Resources:
                         ulimit -n 100000
                         umask 007
                         touch $LOGFILE
-                        chmod 0744 $LOGFILE
-                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 &
+                        chmod 0644 $LOGFILE
+                        PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                        if [ -z $PID ]; then
+                            printf "%s\n" "Fail"
+                        else
+                            echo $PID > $PIDFILE
+                            printf "%s\n" "OK"
+                        fi
                       fi
 
                       return 0
@@ -724,6 +757,9 @@ Resources:
                           echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
                           kill -9 $pid
                         fi
+
+                        rm -f $PIDFILE
+                        echo "Stopped"
                       else
                         echo "$NAME is not running"
                       fi
@@ -764,7 +800,12 @@ Resources:
                   # processname: nomad-agent
 
                   DAEMON=/usr/local/bin/nomad
-                  DAEMON_USER=nomad
+
+                  # On Linux, Nomad will use cgroups, and a chroot to isolate the resources of
+                  # a process and as such the Nomad agent must be run as root.
+                  DAEMON_USER=root
+
+                  SHUTDOWN_WAIT=20
 
                   NAME=nomad-agent
                   DESC="Nomad Agent"
@@ -777,10 +818,8 @@ Resources:
                       -config /etc/nomad.d/agent.hcl \
                       -config /etc/nomad.d/advertise.hcl"
 
-                  DAEMON_STOP_OPTS="node-drain -self -enable -yes"
-
                   function daemon_pid {
-                    echo $(ps aux | grep "$DAEMON $DAEMON_START_OPTS" | grep -v grep | awk '{ print $2 }')
+                    cat $PIDFILE 2> /dev/null
                   }
 
                   function start {
@@ -793,8 +832,14 @@ Resources:
                         ulimit -n 100000
                         umask 007
                         touch $LOGFILE
-                        chmod 0744 $LOGFILE
-                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 &
+                        chmod 0644 $LOGFILE
+                        PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                        if [ -z $PID ]; then
+                            printf "%s\n" "Fail"
+                        else
+                            echo $PID > $PIDFILE
+                            printf "%s\n" "OK"
+                        fi
                       fi
 
                       return 0
@@ -815,7 +860,7 @@ Resources:
                       if [ -n "$pid" ]
                       then
                         echo "Stopping $NAME"
-                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+                        kill $pid 2>&1
 
                         kwait=$SHUTDOWN_WAIT
                         count=0;
@@ -830,6 +875,9 @@ Resources:
                           echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
                           kill -9 $pid
                         fi
+
+                        rm -f $PIDFILE
+                        echo "Stopped"
                       else
                         echo "$NAME is not running"
                       fi
@@ -882,20 +930,26 @@ Resources:
                 datacenter = "${AWS::Region}"
                 client {
                   enabled = true
+
+                  options = {
+                    "driver.raw_exec.enable" = "1"
+                  }
                 }
                 consul {
                   # The address to the Consul agent.
                   address = "127.0.0.1:8500"
 
                   # The service name to register the server and client with Consul.
+                  server_service_name = "nomad-server"
                   client_service_name = "nomad-client"
 
                   # Enables automatically registering the services.
                   auto_advertise = true
-
-                  # Enabling client to bootstrap using Consul.
-                  client_auto_join = true
                 }
+
+                leave_on_interrupt = true
+                leave_on_terminate = true
+                log_level = "DEBUG"
               mode: '000444'
               owner: root
               group: root
@@ -925,7 +979,8 @@ Resources:
         Fn::Sub: "${pConsulIAMStack}-ConsulServerMemberInstanceProfile"
       ImageId: !Ref pClusterMemberAmiId
       InstanceMonitoring: false
-      InstanceType: !Ref pInstanceType
+#      InstanceType: !Ref pInstanceType
+      InstanceType: 't2.medium'
       KeyName: !Ref pKeyName
       SecurityGroups:
         - !Ref rSSHAccessSecurityGroup
@@ -973,6 +1028,8 @@ Resources:
       HealthCheckGracePeriod: 5
       HealthCheckType: EC2
       LaunchConfigurationName: !Ref rNomadAgentLaunchConfiguration
+      LoadBalancerNames:
+        - !Ref rHashiUILoadBalancer
       MaxSize: !Ref pMaxAgentCapacity
       MinSize: 0
       Tags:
@@ -1025,7 +1082,96 @@ Resources:
           FromPort: 4646
           IpProtocol: TCP
           ToPort: 4648
+        - CidrIp: !Ref pNomandServerAccessCIDR
+          FromPort: 4646
+          IpProtocol: TCP
+          ToPort: 4648
+        - SourceSecurityGroupId: !Ref rNomadClusterSecurityGroup
+          FromPort: 3000
+          IpProtocol: TCP
+          ToPort: 3000
+        - CidrIp: !Ref pNomandServerAccessCIDR
+          FromPort: 3000
+          IpProtocol: TCP
+          ToPort: 3000
       Tags:
         - Key: Name
           Value: !Sub "${pResourceNamePrefix}-nomad-gossip-sg"
       VpcId: !Ref pVpcId
+
+
+  rNomadLoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      Listeners:
+        - LoadBalancerPort: '4646'
+          InstancePort: '4646'
+          Protocol: TCP
+        - LoadBalancerPort: '4647'
+          InstancePort: '4647'
+          Protocol: TCP
+        - LoadBalancerPort: '4648'
+          InstancePort: '4648'
+          Protocol: TCP
+      HealthCheck:
+        Target: 'HTTP:4646/v1/agent/self'
+        HealthyThreshold: '3'
+        UnhealthyThreshold: '5'
+        Interval: '30'
+        Timeout: '5'
+      ConnectionDrainingPolicy:
+        Enabled: 'true'
+        Timeout: '15'
+      SecurityGroups:
+        - !Ref rNomadClusterSecurityGroup
+        - !Ref rNomadHttpRpcSerfSecurityGroup
+      Scheme: internal
+      Subnets: !Ref pSubnetIds
+
+
+  rNomadServerDNS:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Ref pHostedZoneName
+      Comment: Alias to easier access for nomad servers via http / rpc / serf
+      RecordSets:
+        - Name: !Sub "${pResourceNamePrefix}.${pHostedZoneName}"
+          Type: A
+          AliasTarget:
+            HostedZoneId: !GetAtt [ rNomadLoadBalancer, CanonicalHostedZoneNameID ]
+            DNSName: !GetAtt [ rNomadLoadBalancer, DNSName ]
+
+
+  rHashiUILoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      Listeners:
+        - LoadBalancerPort: '80'
+          InstancePort: '3000'
+          Protocol: TCP
+      HealthCheck:
+        Target: 'HTTP:3000/'
+        HealthyThreshold: '3'
+        UnhealthyThreshold: '5'
+        Interval: '30'
+        Timeout: '5'
+      ConnectionDrainingPolicy:
+        Enabled: 'true'
+        Timeout: '15'
+      SecurityGroups:
+        - !Ref rNomadClusterSecurityGroup
+      Scheme: internal
+      Subnets: !Ref pSubnetIds
+
+
+  rHashiUIServerDNS:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Ref pHostedZoneName
+      Comment: Alias to easier access for nomad UI
+      RecordSets:
+        - Name: !Sub "${pResourceNamePrefix}-hashiui.${pHostedZoneName}"
+          Type: A
+          AliasTarget:
+            HostedZoneId: !GetAtt [ rHashiUILoadBalancer, CanonicalHostedZoneNameID ]
+            DNSName: !GetAtt [ rHashiUILoadBalancer, DNSName ]

@@ -1028,8 +1028,6 @@ Resources:
       HealthCheckGracePeriod: 5
       HealthCheckType: EC2
       LaunchConfigurationName: !Ref rNomadAgentLaunchConfiguration
-      LoadBalancerNames:
-        - !Ref rHashiUILoadBalancer
       MaxSize: !Ref pMaxAgentCapacity
       MinSize: 0
       Tags:
@@ -1140,38 +1138,3 @@ Resources:
           AliasTarget:
             HostedZoneId: !GetAtt [ rNomadLoadBalancer, CanonicalHostedZoneNameID ]
             DNSName: !GetAtt [ rNomadLoadBalancer, DNSName ]
-
-
-  rHashiUILoadBalancer:
-    Type: AWS::ElasticLoadBalancing::LoadBalancer
-    Properties:
-      Listeners:
-        - LoadBalancerPort: '80'
-          InstancePort: '3000'
-          Protocol: TCP
-      HealthCheck:
-        Target: 'HTTP:3000/'
-        HealthyThreshold: '3'
-        UnhealthyThreshold: '5'
-        Interval: '30'
-        Timeout: '5'
-      ConnectionDrainingPolicy:
-        Enabled: 'true'
-        Timeout: '15'
-      SecurityGroups:
-        - !Ref rNomadClusterSecurityGroup
-      Scheme: internal
-      Subnets: !Ref pSubnetIds
-
-
-  rHashiUIServerDNS:
-    Type: AWS::Route53::RecordSetGroup
-    Properties:
-      HostedZoneName: !Ref pHostedZoneName
-      Comment: Alias to easier access for nomad UI
-      RecordSets:
-        - Name: !Sub "${pResourceNamePrefix}-hashiui.${pHostedZoneName}"
-          Type: A
-          AliasTarget:
-            HostedZoneId: !GetAtt [ rHashiUILoadBalancer, CanonicalHostedZoneNameID ]
-            DNSName: !GetAtt [ rHashiUILoadBalancer, DNSName ]

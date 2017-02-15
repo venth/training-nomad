@@ -23,6 +23,16 @@ Resources:
                   - ec2:DescribeInstances
                 Resource: '*'
                 Effect: Allow
+              - Sid: pullingFromEcr
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:DescribeRepositories
+                  - ecr:GetAuthorizationToken
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:ListImages
+                Effect: Allow
+                Resource: '*'
 
 
   rConsulServerMemberRoleInstanceProfile:

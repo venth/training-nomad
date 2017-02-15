@@ -645,6 +645,17 @@ Resources:
                 }
                 EOF
                 chmod 0444 /etc/nomad.d/advertise.hcl
+            04_authenticate_in_ecr:
+              command: !Sub |
+                #!/bin/bash
+
+                # ignore, if docker already started
+                # docker just has to work
+                service docker start 2> /dev/null
+                $(aws --region=${AWS::Region} ecr get-login)
+                cp /root/.docker/config.json /etc/docker/docker-ecr-auth.json
+
+                chmod 0440 /etc/docker/docker-ecr-auth.json
           files:
             /etc/consul.d/agent/config.json:
               content: !Sub |
@@ -930,9 +941,9 @@ Resources:
                 datacenter = "${AWS::Region}"
                 client {
                   enabled = true
-
-                  options = {
-                    "driver.raw_exec.enable" = "1"
+                  network_speed = 10000
+                  options {
+                    "docker.auth.config" = "/etc/docker/docker-ecr-auth.json"
                   }
                 }
                 consul {
@@ -949,7 +960,7 @@ Resources:
 
                 leave_on_interrupt = true
                 leave_on_terminate = true
-                log_level = "DEBUG"
+                log_level = "INFO"
               mode: '000444'
               owner: root
               group: root
@@ -974,6 +985,12 @@ Resources:
                   - /etc/init.d/nomad-agent
                   - /etc/nomad.d/agent.hcl
                   - /etc/nomad.d/advertise.hcl
+              docker:
+                enabled: true
+                ensureRunning: true
+              cgconfig:
+                enabled: true
+                ensureRunning: true
     Properties:
       IamInstanceProfile: !ImportValue
         Fn::Sub: "${pConsulIAMStack}-ConsulServerMemberInstanceProfile"
@@ -996,7 +1013,8 @@ Resources:
           yum install -y \
               aws-cfn-bootstrap \
               unzip \
-              wget
+              wget \
+              docker
 
           function error_exit {
             /opt/aws/bin/cfn-signal \
@@ -1092,6 +1110,14 @@ Resources:
           FromPort: 3000
           IpProtocol: TCP
           ToPort: 3000
+        - SourceSecurityGroupId: !Ref rNomadClusterSecurityGroup
+          FromPort: 8080
+          IpProtocol: TCP
+          ToPort: 8080
+        - CidrIp: !Ref pNomandServerAccessCIDR
+          FromPort: 8080
+          IpProtocol: TCP
+          ToPort: 8080
       Tags:
         - Key: Name
           Value: !Sub "${pResourceNamePrefix}-nomad-gossip-sg"

@@ -18,16 +18,16 @@ Parameters:
   pMaxServerCapacity:
     Type: Number
     Default: 5
-    Description: Maximal number of nomad servers
-  pDesiredAgentCapacity:
-    Type: Number
-    Default: 1
-    Description: Number of client instances to launch in your Nomad cluster.
-  pMaxAgentCapacity:
+    Description: Maximal number of nomad servers. Note that maximal capacity need to include room for rolling update
+  pDesiredClientCapacity:
     Type: Number
     Default: 2
-    Description: Maximal number of machines with nomad agents
-  pInstanceType:
+    Description: Number of client instances to launch in your Nomad cluster.
+  pMaxClientCapacity:
+    Type: Number
+    Default: 20
+    Description: Maximal number of machines with nomad client. Note that maximal capacity need to include room for rolling update
+  pServerInstanceType:
     Description: The EC2 instance type
     Type: String
     Default: t2.micro
@@ -64,7 +64,45 @@ Parameters:
       - i2.2xlarge
       - i2.4xlarge
       - i2.8xlarg
-    ConstraintDescription: EC2 instance types for Nomad cluster
+    ConstraintDescription: EC2 instance types for Nomad server
+  pClientInstanceType:
+    Description: The EC2 instance type
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - m4.large
+      - m4.xlarge
+      - m4.2xlarge
+      - m4.4xlarge
+      - m4.10xlarge
+      - m3.medium
+      - m3.large
+      - m3.xlarge
+      - m3.2xlarge
+      - c4.large
+      - c4.xlarge
+      - c4.2xlarge
+      - c4.4xlarge
+      - c4.8xlarge
+      - c3.large
+      - c3.xlarge
+      - c3.2xlarge
+      - c3.4xlarge
+      - c3.8xlarge
+      - r3.large
+      - r3.xlarge
+      - r3.2xlarge
+      - r3.4xlarge
+      - r3.8xlarge
+      - i2.xlarge
+      - i2.2xlarge
+      - i2.4xlarge
+      - i2.8xlarg
+    ConstraintDescription: EC2 instance types for Nomad client
   pVpcId:
     Description: Unique identifier of vpc to host Nomad cluster
     Type: AWS::EC2::VPC::Id
@@ -99,7 +137,7 @@ Parameters:
     Type: String
     Default: server
   pNomadVersion:
-    Description: Version of Nomad agent
+    Description: Version of Nomad
     Type: String
     Default: 0.5.4
   pConsulServerStack:
@@ -516,7 +554,7 @@ Resources:
         Fn::Sub: "${pConsulIAMStack}-ConsulServerMemberInstanceProfile"
       ImageId: !Ref pClusterMemberAmiId
       InstanceMonitoring: false
-      InstanceType: !Ref pInstanceType
+      InstanceType: !Ref pServerInstanceType
       KeyName: !Ref pKeyName
       SecurityGroups:
         - !Ref rSSHAccessSecurityGroup
@@ -586,7 +624,7 @@ Resources:
         WaitOnResourceSignals: true
 
 
-  rNomadAgentLaunchConfiguration:
+  rNomadClientLaunchConfiguration:
     Type: AWS::AutoScaling::LaunchConfiguration
     Metadata:
       AWS::CloudFormation::Init:
@@ -612,7 +650,7 @@ Resources:
 
                 mkdir -p /etc/consul.d
                 ln -sf /opt/consul/consul /usr/local/bin/
-            02_install_nomand_agent:
+            02_install_nomand_client:
               command: !Sub |
                 #!/bin/bash
 
@@ -802,13 +840,13 @@ Resources:
               mode: '000755'
               owner: root
               group: root
-            /etc/init.d/nomad-agent:
+            /etc/init.d/nomad-client:
               content: !Sub |
                   #!/bin/bash
-                  # nomad-agent daemon
+                  # nomad-client daemon
                   # chkconfig: 345 20 80
-                  # description: nomad-agent daemon
-                  # processname: nomad-agent
+                  # description: nomad-client daemon
+                  # processname: nomad-client
 
                   DAEMON=/usr/local/bin/nomad
 
@@ -818,7 +856,7 @@ Resources:
 
                   SHUTDOWN_WAIT=20
 
-                  NAME=nomad-agent
+                  NAME=nomad-client
                   DESC="Nomad Agent"
                   PIDFILE=/var/run/$NAME.pid
                   LOGFILE=/var/log/$NAME.log
@@ -826,7 +864,7 @@ Resources:
                   DATACENTER="${AWS::Region}"
 
                   DAEMON_START_OPTS="agent \
-                      -config /etc/nomad.d/agent.hcl \
+                      -config /etc/nomad.d/client.hcl \
                       -config /etc/nomad.d/advertise.hcl"
 
                   function daemon_pid {
@@ -932,10 +970,10 @@ Resources:
               content: !Sub |
                 [cfn-auto-reloader-hook]
                 triggers=post.update
-                path=Resources.rNomadAgentLaunchConfiguration.Metadata.AWS::CloudFormation::Init
-                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource rNomadAgentLaunchConfiguration --region ${AWS::Region}
+                path=Resources.rNomadClientLaunchConfiguration.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource rNomadClientLaunchConfiguration --region ${AWS::Region}
                 runas=root
-            /etc/nomad.d/agent.hcl:
+            /etc/nomad.d/client.hcl:
               content: !Sub |
                 data_dir  = "/opt/nomad/data"
                 datacenter = "${AWS::Region}"
@@ -978,12 +1016,12 @@ Resources:
                 files:
                   - /etc/init.d/consul-agent
                   - /etc/consul.d/agent/config.json
-              nomad-agent:
+              nomad-client:
                 enabled: true
                 ensureRunning: true
                 files:
-                  - /etc/init.d/nomad-agent
-                  - /etc/nomad.d/agent.hcl
+                  - /etc/init.d/nomad-client
+                  - /etc/nomad.d/client.hcl
                   - /etc/nomad.d/advertise.hcl
               docker:
                 enabled: true
@@ -996,8 +1034,7 @@ Resources:
         Fn::Sub: "${pConsulIAMStack}-ConsulServerMemberInstanceProfile"
       ImageId: !Ref pClusterMemberAmiId
       InstanceMonitoring: false
-#      InstanceType: !Ref pInstanceType
-      InstanceType: 't2.medium'
+      InstanceType: !Ref pClientInstanceType
       KeyName: !Ref pKeyName
       SecurityGroups:
         - !Ref rSSHAccessSecurityGroup
@@ -1021,7 +1058,7 @@ Resources:
                 --success false \
                 --reason "$1 - look on /var/log" \
                 --stack ${AWS::StackName} \
-                --resource rNomadAgentAutoScalingGroup \
+                --resource rNomadClientAutoScalingGroup \
                 --region ${AWS::Region}
             exit 1
           }
@@ -1030,30 +1067,30 @@ Resources:
 
           /opt/aws/bin/cfn-init \
               --stack ${AWS::StackName} \
-              --resource rNomadAgentLaunchConfiguration \
+              --resource rNomadClientLaunchConfiguration \
               --region ${AWS::Region} || error_exit 'Error during initialization script'
 
           /opt/aws/bin/cfn-signal --success true \
               --stack ${AWS::StackName} \
-              --resource rNomadAgentAutoScalingGroup \
+              --resource rNomadClientAutoScalingGroup \
               --region ${AWS::Region}
 
 
-  rNomadAgentAutoScalingGroup:
+  rNomadClientAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
-      DesiredCapacity: !Ref pDesiredAgentCapacity
+      DesiredCapacity: !Ref pDesiredClientCapacity
       HealthCheckGracePeriod: 5
       HealthCheckType: EC2
-      LaunchConfigurationName: !Ref rNomadAgentLaunchConfiguration
-      MaxSize: !Ref pMaxAgentCapacity
+      LaunchConfigurationName: !Ref rNomadClientLaunchConfiguration
+      MaxSize: !Ref pMaxClientCapacity
       MinSize: 0
       Tags:
         - Key: Name
-          Value: !Sub "${pResourceNamePrefix}-nomad-agent-asg"
+          Value: !Sub "${pResourceNamePrefix}-nomad-client-asg"
           PropagateAtLaunch: true
         - Key: role
-          Value: nomand-agent
+          Value: nomand-client
           PropagateAtLaunch: true
       VPCZoneIdentifier: !Ref pSubnetIds
     CreationPolicy:

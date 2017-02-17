@@ -249,243 +249,243 @@ Resources:
               group: root
             /etc/init.d/consul-agent:
               content: !Sub |
-                  #!/bin/bash
-                  # consul-agent daemon
-                  # chkconfig: 345 20 80
-                  # description: consul-agent daemon
-                  # processname: consul-agent
+                #!/bin/bash
+                # consul-agent daemon
+                # chkconfig: 345 20 80
+                # description: consul-agent daemon
+                # processname: consul-agent
 
-                  DAEMON=/usr/local/bin/consul
-                  DAEMON_USER=consul
+                DAEMON=/usr/local/bin/consul
+                DAEMON_USER=consul
 
-                  SHUTDOWN_WAIT=20
+                SHUTDOWN_WAIT=20
 
-                  NAME=consul-agent
-                  DESC="Consul Agent"
-                  PIDFILE=/var/run/$NAME.pid
-                  LOGFILE=/var/log/$NAME.log
-                  SCRIPTNAME=/etc/init.d/$NAME
-                  DATACENTER="${AWS::Region}"
+                NAME=consul-agent
+                DESC="Consul Agent"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+                DATACENTER="${AWS::Region}"
 
-                  ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+                ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
 
-                  DAEMON_START_OPTS="agent \
-                      -domain 'consul.' \
-                      -advertise $ADVERTISE_IP \
-                      -datacenter $DATACENTER \
-                      -client 0.0.0.0 \
-                      -data-dir /opt/consul/data \
-                      -config-file /etc/consul.d/agent/config.json \
-                      -rejoin -retry-join-ec2-tag-key ${pConsulClusterTagName} \
-                      -retry-join-ec2-tag-value ${pConsulClusterTagMemberValue} \
-                      -retry-join-ec2-region ${AWS::Region}"
+                DAEMON_START_OPTS="agent \
+                    -domain 'consul.' \
+                    -advertise $ADVERTISE_IP \
+                    -datacenter $DATACENTER \
+                    -client 0.0.0.0 \
+                    -data-dir /opt/consul/data \
+                    -config-file /etc/consul.d/agent/config.json \
+                    -rejoin -retry-join-ec2-tag-key ${pConsulClusterTagName} \
+                    -retry-join-ec2-tag-value ${pConsulClusterTagMemberValue} \
+                    -retry-join-ec2-region ${AWS::Region}"
 
-                  DAEMON_STOP_OPTS="leave"
+                DAEMON_STOP_OPTS="leave"
 
-                  function daemon_pid {
-                    cat $PIDFILE 2> /dev/null
-                  }
+                function daemon_pid {
+                  cat $PIDFILE 2> /dev/null
+                }
 
-                  function start {
-                    pid=$(daemon_pid)
-                      if [ -n "$pid" ]
-                      then
-                        echo "$NAME is already running (pid: $pid)"
-                      else
-                        echo "Starting $NAME"
-                        ulimit -n 100000
-                        umask 007
-                        touch $LOGFILE
-                        chmod 0644 $LOGFILE
-                        PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
-                        if [ -z $PID ]; then
-                            printf "%s\n" "Fail"
-                        else
-                            echo $PID > $PIDFILE
-                            printf "%s\n" "OK"
-                        fi
-                      fi
-
-                      return 0
-                  }
-
-                  function status {
-                    pid=$(daemon_pid)
+                function start {
+                  pid=$(daemon_pid)
                     if [ -n "$pid" ]
                     then
-                      echo "$NAME is running with pid: $pid"
+                      echo "$NAME is already running (pid: $pid)"
+                    else
+                      echo "Starting $NAME"
+                      ulimit -n 100000
+                      umask 007
+                      touch $LOGFILE
+                      chmod 0644 $LOGFILE
+                      PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                      if [ -z $PID ]; then
+                          printf "%s\n" "Fail"
+                      else
+                          echo $PID > $PIDFILE
+                          printf "%s\n" "OK"
+                      fi
+                    fi
+
+                    return 0
+                }
+
+                function status {
+                  pid=$(daemon_pid)
+                  if [ -n "$pid" ]
+                  then
+                    echo "$NAME is running with pid: $pid"
+                  else
+                    echo "$NAME is not running"
+                  fi
+                }
+
+                function stop {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "Stopping $NAME"
+                      /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+
+                      kwait=$SHUTDOWN_WAIT
+                      count=0;
+                      until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                      do
+                        echo -n -e "\nwaiting for processes to exit";
+                        sleep 1
+                        count=$count+1;
+                      done
+
+                      if [[ $count -gt $kwait ]]; then
+                        echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                        kill -9 $pid
+                      fi
+
+                      rm -f $PIDFILE
+                      echo "Stopped"
                     else
                       echo "$NAME is not running"
                     fi
-                  }
 
-                  function stop {
-                    pid=$(daemon_pid)
-                      if [ -n "$pid" ]
-                      then
-                        echo "Stopping $NAME"
-                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+                    return 0
+                }
 
-                        kwait=$SHUTDOWN_WAIT
-                        count=0;
-                        until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
-                        do
-                          echo -n -e "\nwaiting for processes to exit";
-                          sleep 1
-                          count=$count+1;
-                        done
+                case "$1" in
+                start)
+                  start
+                  status
+                ;;
+                status)
+                  status
+                ;;
+                stop)
+                  stop
+                ;;
 
-                        if [[ $count -gt $kwait ]]; then
-                          echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
-                          kill -9 $pid
-                        fi
+                restart)
+                  stop
+                  start
+                ;;
 
-                        rm -f $PIDFILE
-                        echo "Stopped"
-                      else
-                        echo "$NAME is not running"
-                      fi
-
-                      return 0
-                  }
-
-                  case "$1" in
-                  start)
-                    start
-                    status
-                  ;;
-                  status)
-                    status
-                  ;;
-                  stop)
-                    stop
-                  ;;
-
-                  restart)
-                    stop
-                    start
-                  ;;
-
-                  *)
-                    echo "Usage: $0 {status|start|stop|restart}"
-                    exit 1
-                  esac
+                *)
+                  echo "Usage: $0 {status|start|stop|restart}"
+                  exit 1
+                esac
               mode: '000755'
               owner: root
               group: root
             /etc/init.d/nomad-server:
               content: !Sub |
-                  #!/bin/bash
-                  # nomad-server daemon
-                  # chkconfig: 345 20 80
-                  # description: nomad-server daemon
-                  # processname: nomad-server
+                #!/bin/bash
+                # nomad-server daemon
+                # chkconfig: 345 20 80
+                # description: nomad-server daemon
+                # processname: nomad-server
 
-                  DAEMON=/usr/local/bin/nomad
-                  DAEMON_USER=nomad
+                DAEMON=/usr/local/bin/nomad
+                DAEMON_USER=nomad
 
-                  SHUTDOWN_WAIT=20
+                SHUTDOWN_WAIT=20
 
-                  NAME=nomad-server
-                  DESC="Nomad Server"
-                  PIDFILE=/var/run/$NAME.pid
-                  LOGFILE=/var/log/$NAME.log
-                  SCRIPTNAME=/etc/init.d/$NAME
-                  DATACENTER="${AWS::Region}"
+                NAME=nomad-server
+                DESC="Nomad Server"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+                DATACENTER="${AWS::Region}"
 
-                  DAEMON_START_OPTS="agent \
-                      -config /etc/nomad.d/server.hcl \
-                      -config /etc/nomad.d/advertise.hcl"
+                DAEMON_START_OPTS="agent \
+                    -config /etc/nomad.d/server.hcl \
+                    -config /etc/nomad.d/advertise.hcl"
 
-                  function daemon_pid {
-                    cat $PIDFILE 2> /dev/null
-                  }
+                function daemon_pid {
+                  cat $PIDFILE 2> /dev/null
+                }
 
-                  function start {
-                    pid=$(daemon_pid)
-                      if [ -n "$pid" ]
-                      then
-                        echo "$NAME is already running (pid: $pid)"
-                      else
-                        echo "Starting $NAME"
-                        ulimit -n 100000
-                        umask 007
-                        touch $LOGFILE
-                        chmod 0644 $LOGFILE
-                        PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
-                        if [ -z $PID ]; then
-                            printf "%s\n" "Fail"
-                        else
-                            echo $PID > $PIDFILE
-                            printf "%s\n" "OK"
-                        fi
-                      fi
-
-                      return 0
-                  }
-
-                  function status {
-                    pid=$(daemon_pid)
+                function start {
+                  pid=$(daemon_pid)
                     if [ -n "$pid" ]
                     then
-                      echo "$NAME is running with pid: $pid"
+                      echo "$NAME is already running (pid: $pid)"
+                    else
+                      echo "Starting $NAME"
+                      ulimit -n 100000
+                      umask 007
+                      touch $LOGFILE
+                      chmod 0644 $LOGFILE
+                      PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                      if [ -z $PID ]; then
+                          printf "%s\n" "Fail"
+                      else
+                          echo $PID > $PIDFILE
+                          printf "%s\n" "OK"
+                      fi
+                    fi
+
+                    return 0
+                }
+
+                function status {
+                  pid=$(daemon_pid)
+                  if [ -n "$pid" ]
+                  then
+                    echo "$NAME is running with pid: $pid"
+                  else
+                    echo "$NAME is not running"
+                  fi
+                }
+
+                function stop {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "Stopping $NAME"
+
+                      kill $pid 2>&1
+
+                      kwait=$SHUTDOWN_WAIT
+                      count=0;
+                      until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                      do
+                        echo -n -e "\nwaiting for processes to exit";
+                        sleep 1
+                        count=$count+1;
+                      done
+
+                      if [[ $count -gt $kwait ]]; then
+                        echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                        kill -9 $pid
+                      fi
+
+                      rm -f $PIDFILE
+                      echo "Stopped"
                     else
                       echo "$NAME is not running"
                     fi
-                  }
 
-                  function stop {
-                    pid=$(daemon_pid)
-                      if [ -n "$pid" ]
-                      then
-                        echo "Stopping $NAME"
+                    return 0
+                }
 
-                        kill $pid 2>&1
+                case "$1" in
+                start)
+                  start
+                  status
+                ;;
+                status)
+                  status
+                ;;
+                stop)
+                  stop
+                ;;
 
-                        kwait=$SHUTDOWN_WAIT
-                        count=0;
-                        until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
-                        do
-                          echo -n -e "\nwaiting for processes to exit";
-                          sleep 1
-                          count=$count+1;
-                        done
+                restart)
+                  stop
+                  start
+                ;;
 
-                        if [[ $count -gt $kwait ]]; then
-                          echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
-                          kill -9 $pid
-                        fi
-
-                        rm -f $PIDFILE
-                        echo "Stopped"
-                      else
-                        echo "$NAME is not running"
-                      fi
-
-                      return 0
-                  }
-
-                  case "$1" in
-                  start)
-                    start
-                    status
-                  ;;
-                  status)
-                    status
-                  ;;
-                  stop)
-                    stop
-                  ;;
-
-                  restart)
-                    stop
-                    start
-                  ;;
-
-                  *)
-                    echo "Usage: $0 {status|start|stop|restart}"
-                    exit 1
-                  esac
+                *)
+                  echo "Usage: $0 {status|start|stop|restart}"
+                  exit 1
+                esac
               mode: '000755'
               owner: root
               group: root
@@ -716,245 +716,245 @@ Resources:
               group: root
             /etc/init.d/consul-agent:
               content: !Sub |
-                  #!/bin/bash
-                  # consul-agent daemon
-                  # chkconfig: 345 20 80
-                  # description: consul-agent daemon
-                  # processname: consul-agent
+                #!/bin/bash
+                # consul-agent daemon
+                # chkconfig: 345 20 80
+                # description: consul-agent daemon
+                # processname: consul-agent
 
-                  DAEMON=/usr/local/bin/consul
-                  DAEMON_USER=consul
+                DAEMON=/usr/local/bin/consul
+                DAEMON_USER=consul
 
-                  SHUTDOWN_WAIT=20
+                SHUTDOWN_WAIT=20
 
-                  NAME=consul-agent
-                  DESC="Consul Agent"
-                  PIDFILE=/var/run/$NAME.pid
-                  LOGFILE=/var/log/$NAME.log
-                  SCRIPTNAME=/etc/init.d/$NAME
-                  DATACENTER="${AWS::Region}"
+                NAME=consul-agent
+                DESC="Consul Agent"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+                DATACENTER="${AWS::Region}"
 
-                  ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+                ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
 
-                  DAEMON_START_OPTS="agent \
-                      -domain 'consul.' \
-                      -advertise $ADVERTISE_IP \
-                      -datacenter $DATACENTER \
-                      -client 0.0.0.0 \
-                      -data-dir /opt/consul/data \
-                      -config-file /etc/consul.d/agent/config.json \
-                      -rejoin -retry-join-ec2-tag-key ${pConsulClusterTagName} \
-                      -retry-join-ec2-tag-value ${pConsulClusterTagMemberValue} \
-                      -retry-join-ec2-region ${AWS::Region}"
+                DAEMON_START_OPTS="agent \
+                    -domain 'consul.' \
+                    -advertise $ADVERTISE_IP \
+                    -datacenter $DATACENTER \
+                    -client 0.0.0.0 \
+                    -data-dir /opt/consul/data \
+                    -config-file /etc/consul.d/agent/config.json \
+                    -rejoin -retry-join-ec2-tag-key ${pConsulClusterTagName} \
+                    -retry-join-ec2-tag-value ${pConsulClusterTagMemberValue} \
+                    -retry-join-ec2-region ${AWS::Region}"
 
-                  DAEMON_STOP_OPTS="leave"
+                DAEMON_STOP_OPTS="leave"
 
-                  function daemon_pid {
-                    cat $PIDFILE 2> /dev/null
-                  }
+                function daemon_pid {
+                  cat $PIDFILE 2> /dev/null
+                }
 
-                  function start {
-                    pid=$(daemon_pid)
-                      if [ -n "$pid" ]
-                      then
-                        echo "$NAME is already running (pid: $pid)"
-                      else
-                        echo "Starting $NAME"
-                        ulimit -n 100000
-                        umask 007
-                        touch $LOGFILE
-                        chmod 0644 $LOGFILE
-                        PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
-                        if [ -z $PID ]; then
-                            printf "%s\n" "Fail"
-                        else
-                            echo $PID > $PIDFILE
-                            printf "%s\n" "OK"
-                        fi
-                      fi
-
-                      return 0
-                  }
-
-                  function status {
-                    pid=$(daemon_pid)
+                function start {
+                  pid=$(daemon_pid)
                     if [ -n "$pid" ]
                     then
-                      echo "$NAME is running with pid: $pid"
+                      echo "$NAME is already running (pid: $pid)"
+                    else
+                      echo "Starting $NAME"
+                      ulimit -n 100000
+                      umask 007
+                      touch $LOGFILE
+                      chmod 0644 $LOGFILE
+                      PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                      if [ -z $PID ]; then
+                          printf "%s\n" "Fail"
+                      else
+                          echo $PID > $PIDFILE
+                          printf "%s\n" "OK"
+                      fi
+                    fi
+
+                    return 0
+                }
+
+                function status {
+                  pid=$(daemon_pid)
+                  if [ -n "$pid" ]
+                  then
+                    echo "$NAME is running with pid: $pid"
+                  else
+                    echo "$NAME is not running"
+                  fi
+                }
+
+                function stop {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "Stopping $NAME"
+                      /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+
+                      kwait=$SHUTDOWN_WAIT
+                      count=0;
+                      until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                      do
+                        echo -n -e "\nwaiting for processes to exit";
+                        sleep 1
+                        count=$count+1;
+                      done
+
+                      if [[ $count -gt $kwait ]]; then
+                        echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                        kill -9 $pid
+                      fi
+
+                      rm -f $PIDFILE
+                      echo "Stopped"
                     else
                       echo "$NAME is not running"
                     fi
-                  }
 
-                  function stop {
-                    pid=$(daemon_pid)
-                      if [ -n "$pid" ]
-                      then
-                        echo "Stopping $NAME"
-                        /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+                    return 0
+                }
 
-                        kwait=$SHUTDOWN_WAIT
-                        count=0;
-                        until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
-                        do
-                          echo -n -e "\nwaiting for processes to exit";
-                          sleep 1
-                          count=$count+1;
-                        done
+                case "$1" in
+                start)
+                  start
+                  status
+                ;;
+                status)
+                  status
+                ;;
+                stop)
+                  stop
+                ;;
 
-                        if [[ $count -gt $kwait ]]; then
-                          echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
-                          kill -9 $pid
-                        fi
+                restart)
+                  stop
+                  start
+                ;;
 
-                        rm -f $PIDFILE
-                        echo "Stopped"
-                      else
-                        echo "$NAME is not running"
-                      fi
-
-                      return 0
-                  }
-
-                  case "$1" in
-                  start)
-                    start
-                    status
-                  ;;
-                  status)
-                    status
-                  ;;
-                  stop)
-                    stop
-                  ;;
-
-                  restart)
-                    stop
-                    start
-                  ;;
-
-                  *)
-                    echo "Usage: $0 {status|start|stop|restart}"
-                    exit 1
-                  esac
+                *)
+                  echo "Usage: $0 {status|start|stop|restart}"
+                  exit 1
+                esac
               mode: '000755'
               owner: root
               group: root
             /etc/init.d/nomad-client:
               content: !Sub |
-                  #!/bin/bash
-                  # nomad-client daemon
-                  # chkconfig: 345 20 80
-                  # description: nomad-client daemon
-                  # processname: nomad-client
+                #!/bin/bash
+                # nomad-client daemon
+                # chkconfig: 345 20 80
+                # description: nomad-client daemon
+                # processname: nomad-client
 
-                  DAEMON=/usr/local/bin/nomad
+                DAEMON=/usr/local/bin/nomad
 
-                  # On Linux, Nomad will use cgroups, and a chroot to isolate the resources of
-                  # a process and as such the Nomad agent must be run as root.
-                  DAEMON_USER=root
+                # On Linux, Nomad will use cgroups, and a chroot to isolate the resources of
+                # a process and as such the Nomad agent must be run as root.
+                DAEMON_USER=root
 
-                  SHUTDOWN_WAIT=20
+                SHUTDOWN_WAIT=20
 
-                  NAME=nomad-client
-                  DESC="Nomad Agent"
-                  PIDFILE=/var/run/$NAME.pid
-                  LOGFILE=/var/log/$NAME.log
-                  SCRIPTNAME=/etc/init.d/$NAME
-                  DATACENTER="${AWS::Region}"
+                NAME=nomad-client
+                DESC="Nomad Agent"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+                DATACENTER="${AWS::Region}"
 
-                  DAEMON_START_OPTS="agent \
-                      -config /etc/nomad.d/client.hcl \
-                      -config /etc/nomad.d/advertise.hcl"
+                DAEMON_START_OPTS="agent \
+                    -config /etc/nomad.d/client.hcl \
+                    -config /etc/nomad.d/advertise.hcl"
 
-                  function daemon_pid {
-                    cat $PIDFILE 2> /dev/null
-                  }
+                function daemon_pid {
+                  cat $PIDFILE 2> /dev/null
+                }
 
-                  function start {
-                    pid=$(daemon_pid)
-                      if [ -n "$pid" ]
-                      then
-                        echo "$NAME is already running (pid: $pid)"
-                      else
-                        echo "Starting $NAME"
-                        ulimit -n 100000
-                        umask 007
-                        touch $LOGFILE
-                        chmod 0644 $LOGFILE
-                        PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
-                        if [ -z $PID ]; then
-                            printf "%s\n" "Fail"
-                        else
-                            echo $PID > $PIDFILE
-                            printf "%s\n" "OK"
-                        fi
-                      fi
-
-                      return 0
-                  }
-
-                  function status {
-                    pid=$(daemon_pid)
+                function start {
+                  pid=$(daemon_pid)
                     if [ -n "$pid" ]
                     then
-                      echo "$NAME is running with pid: $pid"
+                      echo "$NAME is already running (pid: $pid)"
+                    else
+                      echo "Starting $NAME"
+                      ulimit -n 100000
+                      umask 007
+                      touch $LOGFILE
+                      chmod 0644 $LOGFILE
+                      PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                      if [ -z $PID ]; then
+                          printf "%s\n" "Fail"
+                      else
+                          echo $PID > $PIDFILE
+                          printf "%s\n" "OK"
+                      fi
+                    fi
+
+                    return 0
+                }
+
+                function status {
+                  pid=$(daemon_pid)
+                  if [ -n "$pid" ]
+                  then
+                    echo "$NAME is running with pid: $pid"
+                  else
+                    echo "$NAME is not running"
+                  fi
+                }
+
+                function stop {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "Stopping $NAME"
+                      kill $pid 2>&1
+
+                      kwait=$SHUTDOWN_WAIT
+                      count=0;
+                      until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                      do
+                        echo -n -e "\nwaiting for processes to exit";
+                        sleep 1
+                        count=$count+1;
+                      done
+
+                      if [[ $count -gt $kwait ]]; then
+                        echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                        kill -9 $pid
+                      fi
+
+                      rm -f $PIDFILE
+                      echo "Stopped"
                     else
                       echo "$NAME is not running"
                     fi
-                  }
 
-                  function stop {
-                    pid=$(daemon_pid)
-                      if [ -n "$pid" ]
-                      then
-                        echo "Stopping $NAME"
-                        kill $pid 2>&1
+                    return 0
+                }
 
-                        kwait=$SHUTDOWN_WAIT
-                        count=0;
-                        until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
-                        do
-                          echo -n -e "\nwaiting for processes to exit";
-                          sleep 1
-                          count=$count+1;
-                        done
+                case "$1" in
+                start)
+                  start
+                  status
+                ;;
+                status)
+                  status
+                ;;
+                stop)
+                  stop
+                ;;
 
-                        if [[ $count -gt $kwait ]]; then
-                          echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
-                          kill -9 $pid
-                        fi
+                restart)
+                  stop
+                  start
+                ;;
 
-                        rm -f $PIDFILE
-                        echo "Stopped"
-                      else
-                        echo "$NAME is not running"
-                      fi
-
-                      return 0
-                  }
-
-                  case "$1" in
-                  start)
-                    start
-                    status
-                  ;;
-                  status)
-                    status
-                  ;;
-                  stop)
-                    stop
-                  ;;
-
-                  restart)
-                    stop
-                    start
-                  ;;
-
-                  *)
-                    echo "Usage: $0 {status|start|stop|restart}"
-                    exit 1
-                  esac
+                *)
+                  echo "Usage: $0 {status|start|stop|restart}"
+                  exit 1
+                esac
               mode: '000755'
               owner: root
               group: root
@@ -1103,6 +1103,443 @@ Resources:
         WaitOnResourceSignals: true
 
 
+  rFabioLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_install_consul_agent:
+              command: !Sub |
+                #!/bin/bash
+
+                curl -L \
+                    -XGET 'https://releases.hashicorp.com/consul/${pConsulAgentVersion}/consul_${pConsulAgentVersion}_linux_amd64.zip' \
+                    -o /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
+
+                mkdir -p /opt/consul/data
+                unzip \
+                    /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip \
+                    -d /opt/consul
+                rm -f /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
+
+                useradd -s /bin/false -d /opt/consul -r consul
+                chown -R consul /opt/consul
+                chmod 755 /opt/consul/consul
+
+                mkdir -p /etc/consul.d
+                ln -sf /opt/consul/consul /usr/local/bin/
+            02_install_fabio:
+              command: !Sub |
+                #!/bin/bash
+
+                mkdir -p /opt/fabio
+
+                curl -L \
+                    -XGET 'https://github.com/eBay/fabio/releases/download/v1.3.8/fabio-1.3.8-go1.8-linux_amd64' \
+                    -o /opt/fabio/fabio-1.3.8-go1.8-linux_amd64
+
+                chmod 755 /opt/fabio/fabio-1.3.8-go1.8-linux_amd64
+
+                useradd -s /bin/false -d /opt/fabio -r fabio
+                chown -R fabio /opt/fabio
+
+                ln -sf /opt/fabio/fabio-1.3.8-go1.8-linux_amd64 /usr/local/bin/
+          files:
+            /etc/consul.d/agent/config.json:
+              content: !Sub |
+                {
+                  "log_level": "INFO",
+                  "datacenter": "${AWS::Region}",
+                  "server": false,
+                  "disable_update_check": true,
+                  "data_dir": "/opt/consul/data",
+                  "dns_config": {
+                    "allow_stale": true,
+                    "max_stale": "3s",
+                    "node_ttl": "1m"
+                  },
+                  "skip_leave_on_interrupt": false,
+                  "leave_on_terminate": true
+                }
+              mode: '000444'
+              owner: root
+              group: root
+            /etc/init.d/consul-agent:
+              content: !Sub |
+                #!/bin/bash
+                # consul-agent daemon
+                # chkconfig: 345 20 80
+                # description: consul-agent daemon
+                # processname: consul-agent
+
+                DAEMON=/usr/local/bin/consul
+                DAEMON_USER=consul
+
+                SHUTDOWN_WAIT=20
+
+                NAME=consul-agent
+                DESC="Consul Agent"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+                DATACENTER="${AWS::Region}"
+
+                ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+
+                DAEMON_START_OPTS="agent \
+                    -domain 'consul.' \
+                    -advertise $ADVERTISE_IP \
+                    -datacenter $DATACENTER \
+                    -client 0.0.0.0 \
+                    -data-dir /opt/consul/data \
+                    -config-file /etc/consul.d/agent/config.json \
+                    -rejoin -retry-join-ec2-tag-key ${pConsulClusterTagName} \
+                    -retry-join-ec2-tag-value ${pConsulClusterTagMemberValue} \
+                    -retry-join-ec2-region ${AWS::Region}"
+
+                DAEMON_STOP_OPTS="leave"
+
+                function daemon_pid {
+                  cat $PIDFILE 2> /dev/null
+                }
+
+                function start {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "$NAME is already running (pid: $pid)"
+                    else
+                      echo "Starting $NAME"
+                      ulimit -n 100000
+                      umask 007
+                      touch $LOGFILE
+                      chmod 0644 $LOGFILE
+                      PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                      if [ -z $PID ]; then
+                          printf "%s\n" "Fail"
+                      else
+                          echo $PID > $PIDFILE
+                          printf "%s\n" "OK"
+                      fi
+                    fi
+
+                    return 0
+                }
+
+                function status {
+                  pid=$(daemon_pid)
+                  if [ -n "$pid" ]
+                  then
+                    echo "$NAME is running with pid: $pid"
+                  else
+                    echo "$NAME is not running"
+                  fi
+                }
+
+                function stop {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "Stopping $NAME"
+                      /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+
+                      kwait=$SHUTDOWN_WAIT
+                      count=0;
+                      until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                      do
+                        echo -n -e "\nwaiting for processes to exit";
+                        sleep 1
+                        count=$count+1;
+                      done
+
+                      if [[ $count -gt $kwait ]]; then
+                        echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                        kill -9 $pid
+                      fi
+
+                      rm -f $PIDFILE
+                      echo "Stopped"
+                    else
+                      echo "$NAME is not running"
+                    fi
+
+                    return 0
+                }
+
+                case "$1" in
+                start)
+                  start
+                  status
+                ;;
+                status)
+                  status
+                ;;
+                stop)
+                  stop
+                ;;
+
+                restart)
+                  stop
+                  start
+                ;;
+
+                *)
+                  echo "Usage: $0 {status|start|stop|restart}"
+                  exit 1
+                esac
+              mode: '000755'
+              owner: root
+              group: root
+            /etc/init.d/fabio:
+              content: !Sub |
+                #!/bin/bash
+                # fabio daemon
+                # chkconfig: 345 20 80
+                # description: fabio daemon
+                # processname: fabio
+
+                DAEMON=/usr/local/bin/fabio
+
+                DAEMON_USER=fabio
+
+                SHUTDOWN_WAIT=20
+
+                NAME=fabio
+                DESC="fabio"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+
+                DAEMON_START_OPTS="fabio"
+
+                function daemon_pid {
+                  cat $PIDFILE 2> /dev/null
+                }
+
+                function start {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "$NAME is already running (pid: $pid)"
+                    else
+                      echo "Starting $NAME"
+                      ulimit -n 100000
+                      umask 007
+                      touch $LOGFILE
+                      chmod 0644 $LOGFILE
+                      PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                      if [ -z $PID ]; then
+                          printf "%s\n" "Fail"
+                      else
+                          echo $PID > $PIDFILE
+                          printf "%s\n" "OK"
+                      fi
+                    fi
+
+                    return 0
+                }
+
+                function status {
+                  pid=$(daemon_pid)
+                  if [ -n "$pid" ]
+                  then
+                    echo "$NAME is running with pid: $pid"
+                  else
+                    echo "$NAME is not running"
+                  fi
+                }
+
+                function stop {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "Stopping $NAME"
+                      kill $pid 2>&1
+
+                      kwait=$SHUTDOWN_WAIT
+                      count=0;
+                      until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                      do
+                        echo -n -e "\nwaiting for processes to exit";
+                        sleep 1
+                        count=$count+1;
+                      done
+
+                      if [[ $count -gt $kwait ]]; then
+                        echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                        kill -9 $pid
+                      fi
+
+                      rm -f $PIDFILE
+                      echo "Stopped"
+                    else
+                      echo "$NAME is not running"
+                    fi
+
+                    return 0
+                }
+
+                case "$1" in
+                start)
+                  start
+                  status
+                ;;
+                status)
+                  status
+                ;;
+                stop)
+                  stop
+                ;;
+
+                restart)
+                  stop
+                  start
+                ;;
+
+                *)
+                  echo "Usage: $0 {status|start|stop|restart}"
+                  exit 1
+                esac
+              mode: '000755'
+              owner: root
+              group: root
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack = ${AWS::StackId}
+                region = ${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.rFabioLaunchConfiguration.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource rFabioLaunchConfiguration --region ${AWS::Region}
+                runas=root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+              consul-agent:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/init.d/consul-agent
+                  - /etc/consul.d/agent/config.json
+              fabio:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/init.d/fabio
+    Properties:
+      IamInstanceProfile: !ImportValue
+        Fn::Sub: "${pConsulIAMStack}-ConsulServerMemberInstanceProfile"
+      ImageId: !Ref pClusterMemberAmiId
+      InstanceMonitoring: false
+      InstanceType: 't2.micro'
+      KeyName: !Ref pKeyName
+      SecurityGroups:
+        - !Ref rSSHAccessSecurityGroup
+        - !ImportValue
+          Fn::Sub: "${pConsulServerStack}-ConsulClusterSecurityGroup"
+        - !ImportValue
+          Fn::Sub: "${pConsulServerStack}-ConsulRPCAndGossipSecurityGroup"
+        - !Ref rNomadClusterSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum install -y \
+              aws-cfn-bootstrap \
+              unzip \
+              wget
+
+          function error_exit {
+            /opt/aws/bin/cfn-signal \
+                --success false \
+                --reason "$1 - look on /var/log" \
+                --stack ${AWS::StackName} \
+                --resource rFabioAutoScalingGroup \
+                --region ${AWS::Region}
+            exit 1
+          }
+
+          trap 'error_exit "Line no: $LINENO"' ERR
+
+          /opt/aws/bin/cfn-init \
+              --stack ${AWS::StackName} \
+              --resource rFabioLaunchConfiguration \
+              --region ${AWS::Region} || error_exit 'Error during initialization script'
+
+          /opt/aws/bin/cfn-signal --success true \
+              --stack ${AWS::StackName} \
+              --resource rFabioAutoScalingGroup \
+              --region ${AWS::Region}
+
+
+  rFabioAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: 1
+      HealthCheckGracePeriod: 5
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref rFabioLaunchConfiguration
+      MaxSize: 2
+      MinSize: 0
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-fabio-asg"
+          PropagateAtLaunch: true
+        - Key: role
+          Value: router
+          PropagateAtLaunch: true
+      VPCZoneIdentifier: !Ref pSubnetIds
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        PauseTime: PT10M
+        WaitOnResourceSignals: true
+
+
+  rFabioAccessSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for accessing Fabio
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref rNomadEntryAccessSecurityGroup
+          FromPort: 9999
+          IpProtocol: TCP
+          ToPort: 9999
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-fabio-sg"
+      VpcId: !Ref pVpcId
+
+
+  rNomadEntryAccessSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for accessing nomad managed services from outside
+      SecurityGroupIngress:
+        - CidrIp: !Ref pNomandServerAccessCIDR
+          FromPort: 80
+          IpProtocol: TCP
+          ToPort: 80
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-nomadentry-sg"
+      VpcId: !Ref pVpcId
+
+
   rSSHAccessSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -1140,21 +1577,21 @@ Resources:
           IpProtocol: TCP
           ToPort: 4648
         - SourceSecurityGroupId: !Ref rNomadClusterSecurityGroup
-          FromPort: 3000
+          FromPort: 20000
           IpProtocol: TCP
-          ToPort: 3000
+          ToPort: 60000
         - CidrIp: !Ref pNomandServerAccessCIDR
-          FromPort: 3000
+          FromPort: 20000
           IpProtocol: TCP
-          ToPort: 3000
+          ToPort: 60000
         - SourceSecurityGroupId: !Ref rNomadClusterSecurityGroup
-          FromPort: 8080
-          IpProtocol: TCP
-          ToPort: 8080
+          FromPort: 20000
+          IpProtocol: UDP
+          ToPort: 60000
         - CidrIp: !Ref pNomandServerAccessCIDR
-          FromPort: 8080
-          IpProtocol: TCP
-          ToPort: 8080
+          FromPort: 20000
+          IpProtocol: UDP
+          ToPort: 60000
       Tags:
         - Key: Name
           Value: !Sub "${pResourceNamePrefix}-nomad-gossip-sg"
@@ -1190,6 +1627,38 @@ Resources:
       Subnets: !Ref pSubnetIds
 
 
+  rNomadEntryLoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      Listeners:
+        - LoadBalancerPort: '80'
+          InstancePort: '9999'
+          Protocol: TCP
+          PolicyNames:
+            - EnableProxyProtocolPolicy
+      HealthCheck:
+        Target: 'HTTP:9999/health'
+        HealthyThreshold: '3'
+        UnhealthyThreshold: '5'
+        Interval: '30'
+        Timeout: '5'
+      ConnectionDrainingPolicy:
+        Enabled: 'true'
+        Timeout: '15'
+      Properties:
+        Policies:
+          - PolicyName: EnableProxyProtocolPolicy
+            PolicyType: ProxyProtocolPolicyType
+            InstancePorts: '9999'
+            Attributes:
+              Name: ProxyProtocol
+              Value: true
+      SecurityGroups:
+        - !Ref rNomadEntryAccessSecurityGroup
+      Scheme: internal
+      Subnets: !Ref pSubnetIds
+
+
   rNomadServerDNS:
     Type: AWS::Route53::RecordSetGroup
     Properties:
@@ -1201,3 +1670,16 @@ Resources:
           AliasTarget:
             HostedZoneId: !GetAtt [ rNomadLoadBalancer, CanonicalHostedZoneNameID ]
             DNSName: !GetAtt [ rNomadLoadBalancer, DNSName ]
+
+
+  rNomadEntryDNS:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Ref pHostedZoneName
+      Comment: Alias to easier access any services managed by nomad
+      RecordSets:
+        - Name: !Sub "${pResourceNamePrefix}-entry.${pHostedZoneName}"
+          Type: A
+          AliasTarget:
+            HostedZoneId: !GetAtt [ rNomadEntryLoadBalancer, CanonicalHostedZoneNameID ]
+            DNSName: !GetAtt [ rNomadEntryLoadBalancer, DNSName ]

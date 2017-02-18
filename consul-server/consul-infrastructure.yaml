@@ -447,6 +447,10 @@ Resources:
           IpProtocol: UDP
           ToPort: 8302
         - SourceSecurityGroupId: !Ref rConsulClusterSecurityGroup
+          FromPort: 8400
+          IpProtocol: TCP
+          ToPort: 8400
+        - SourceSecurityGroupId: !Ref rConsulClusterSecurityGroup
           FromPort: 8600
           IpProtocol: TCP
           ToPort: 8600
@@ -493,6 +497,10 @@ Resources:
           IpProtocol: TCP
           ToPort: 8302
         - CidrIp: !Ref pHTTPAccessCIDR
+          FromPort: 8400
+          IpProtocol: TCP
+          ToPort: 8400
+        - CidrIp: !Ref pHTTPAccessCIDR
           FromPort: 8300
           IpProtocol: UDP
           ToPort: 8302
@@ -520,6 +528,9 @@ Resources:
           Protocol: HTTP
         - LoadBalancerPort: '8300'
           InstancePort: '8300'
+          Protocol: TCP
+        - LoadBalancerPort: '8400'
+          InstancePort: '8400'
           Protocol: TCP
         - LoadBalancerPort: '8301'
           InstancePort: '8301'

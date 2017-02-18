@@ -1,0 +1,1101 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Infrastructure for Nomad cluster
+Parameters:
+  pResourceNamePrefix:
+    Type: String
+    Description: prefix used in creation of name for each resource in this template
+  pKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the ECS instances.
+  pDesiredClientCapacity:
+    Type: Number
+    Default: 2
+    Description: Number of client instances to launch in your Nomad cluster.
+  pMaxClientCapacity:
+    Type: Number
+    Default: 20
+    Description: Maximal number of machines with nomad client. Note that maximal capacity need to include room for rolling update
+  pClusterMemberAmiId:
+    Description: unique identifier of AMI used to spin up cluster members
+    Type: AWS::EC2::Image::Id
+    Default: ami-f9619996
+  pClientInstanceType:
+    Description: The EC2 instance type
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - m4.large
+      - m4.xlarge
+      - m4.2xlarge
+      - m4.4xlarge
+      - m4.10xlarge
+      - m3.medium
+      - m3.large
+      - m3.xlarge
+      - m3.2xlarge
+      - c4.large
+      - c4.xlarge
+      - c4.2xlarge
+      - c4.4xlarge
+      - c4.8xlarge
+      - c3.large
+      - c3.xlarge
+      - c3.2xlarge
+      - c3.4xlarge
+      - c3.8xlarge
+      - r3.large
+      - r3.xlarge
+      - r3.2xlarge
+      - r3.4xlarge
+      - r3.8xlarge
+      - i2.xlarge
+      - i2.2xlarge
+      - i2.4xlarge
+      - i2.8xlarg
+    ConstraintDescription: EC2 instance types for Nomad client
+  pVpcId:
+    Description: Unique identifier of vpc to host Nomad cluster
+    Type: AWS::EC2::VPC::Id
+  pSubnetIds:
+    Description: Unique identifier of subnets inside given vpc to host Nomad cluster
+    Type: List<AWS::EC2::Subnet::Id>
+  pHostedZoneName:
+    Description: Hosted zone name defined in Route 53
+    Type: String
+  pSSHAccessCIDR:
+    Description: IP adresses allowed ssh access to Nomad cluster members machines
+    Type: String
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/([0-9]|[1-2][0-9]|3[0-2]))$"
+  pNomandEntryAccessCIDR:
+    Description: IP adresses allowed access to Nomad cluster members machines
+    Type: String
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/([0-9]|[1-2][0-9]|3[0-2]))$"
+  pConsulAgentVersion:
+    Description: Version of Consul agent
+    Type: String
+    Default: 0.7.3
+  pConsulClusterTagName:
+    Description: The name of the tag used to identify a role in consul cluster by value
+    Type: String
+    Default: consul-cluster-role
+  pConsulClusterTagMemberValue:
+    Description: The value of the tag used to identify member role in consul cluster
+    Type: String
+    Default: server
+  pNomadVersion:
+    Description: Version of Nomad
+    Type: String
+    Default: 0.5.4
+  pConsulServerStack:
+    Type: String
+    Description: |
+      Name of the stack containing Consul Servers
+      Expected exported outputs: ConsulClusterSecurityGroup, ConsulRPCAndGossipSecurityGroup
+  pConsulIAMStack:
+    Type: String
+    Description: |
+      Name of the stack containing IAM roles and instance profiles that can be assumed
+      by ec2 instances running on this cluster.
+      Expected exported outputs: ConsulServerMemberInstanceProfile
+  pNomadServerStack:
+    Type: String
+    Description: |
+      Name of the stack containing Nomad Servers
+      Expected exported outputs: NomadClusterSecurityGroup
+
+
+Rules:
+  uSubnetsInVPC:
+    Assertions:
+      - Assert: !EachMemberIn
+        - Fn::ValueOfAll:
+          - AWS::EC2::Subnet::Id
+          - VpcId
+        - Fn::RefAll: AWS::EC2::VPC::Id
+        AssertDescription: All subnets must in the VPC
+
+
+Resources:
+  rNomadClientLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_install_consul_agent:
+              command: !Sub |
+                #!/bin/bash
+
+                curl -L \
+                    -XGET 'https://releases.hashicorp.com/consul/${pConsulAgentVersion}/consul_${pConsulAgentVersion}_linux_amd64.zip' \
+                    -o /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
+
+                mkdir -p /opt/consul/data
+                unzip \
+                    /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip \
+                    -d /opt/consul
+                rm -f /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
+
+                useradd -s /bin/false -d /opt/consul -r consul
+                chown -R consul /opt/consul
+                chmod 755 /opt/consul/consul
+
+                mkdir -p /etc/consul.d
+                ln -sf /opt/consul/consul /usr/local/bin/
+            02_install_nomand_client:
+              command: !Sub |
+                #!/bin/bash
+
+                curl -L \
+                    -XGET 'https://releases.hashicorp.com/nomad/${pNomadVersion}/nomad_${pNomadVersion}_linux_amd64.zip' \
+                    -o /tmp/nomad_${pNomadVersion}_linux_amd64.zip
+
+                mkdir -p /opt/nomad/data
+                unzip \
+                    /tmp/nomad_${pNomadVersion}_linux_amd64.zip \
+                    -d /opt/nomad
+                rm -f /tmp/nomad_${pNomadVersion}_linux_amd64.zip
+
+                chmod 755 /opt/nomad/nomad
+
+                ln -sf /opt/nomad/nomad /usr/local/bin/
+            03_create_advertise_nomad_config:
+              command: !Sub |
+                #!/bin/bash
+
+                ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+
+                cat <<EOF > /etc/nomad.d/advertise.hcl
+                advertise {
+                  # We need to specify our host's IP because we can't
+                  # advertise 0.0.0.0 to other nodes in our cluster.
+                  http = "$ADVERTISE_IP"
+                  rpc  = "$ADVERTISE_IP"
+                  serf = "$ADVERTISE_IP"
+                }
+                EOF
+                chmod 0444 /etc/nomad.d/advertise.hcl
+            04_authenticate_in_ecr:
+              command: !Sub |
+                #!/bin/bash
+
+                # ignore, if docker already started
+                # docker just has to work
+                service docker start 2> /dev/null
+                $(aws --region=${AWS::Region} ecr get-login)
+                cp /root/.docker/config.json /etc/docker/docker-ecr-auth.json
+
+                chmod 0440 /etc/docker/docker-ecr-auth.json
+          files:
+            /etc/consul.d/agent/config.json:
+              content: !Sub |
+                {
+                  "log_level": "INFO",
+                  "datacenter": "${AWS::Region}",
+                  "server": false,
+                  "disable_update_check": true,
+                  "data_dir": "/opt/consul/data",
+                  "dns_config": {
+                    "allow_stale": true,
+                    "max_stale": "3s",
+                    "node_ttl": "1m"
+                  },
+                  "skip_leave_on_interrupt": false,
+                  "leave_on_terminate": true
+                }
+              mode: '000444'
+              owner: root
+              group: root
+            /etc/init.d/consul-agent:
+              content: !Sub |
+                #!/bin/bash
+                # consul-agent daemon
+                # chkconfig: 345 20 80
+                # description: consul-agent daemon
+                # processname: consul-agent
+
+                DAEMON=/usr/local/bin/consul
+                DAEMON_USER=consul
+
+                SHUTDOWN_WAIT=20
+
+                NAME=consul-agent
+                DESC="Consul Agent"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+                DATACENTER="${AWS::Region}"
+
+                ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+
+                DAEMON_START_OPTS="agent \
+                    -domain 'consul.' \
+                    -advertise $ADVERTISE_IP \
+                    -datacenter $DATACENTER \
+                    -client 0.0.0.0 \
+                    -data-dir /opt/consul/data \
+                    -config-file /etc/consul.d/agent/config.json \
+                    -rejoin -retry-join-ec2-tag-key ${pConsulClusterTagName} \
+                    -retry-join-ec2-tag-value ${pConsulClusterTagMemberValue} \
+                    -retry-join-ec2-region ${AWS::Region}"
+
+                DAEMON_STOP_OPTS="leave"
+
+                function daemon_pid {
+                  cat $PIDFILE 2> /dev/null
+                }
+
+                function start {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "$NAME is already running (pid: $pid)"
+                    else
+                      echo "Starting $NAME"
+                      ulimit -n 100000
+                      umask 007
+                      touch $LOGFILE
+                      chmod 0644 $LOGFILE
+                      PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                      if [ -z $PID ]; then
+                          printf "%s\n" "Fail"
+                      else
+                          echo $PID > $PIDFILE
+                          printf "%s\n" "OK"
+                      fi
+                    fi
+
+                    return 0
+                }
+
+                function status {
+                  pid=$(daemon_pid)
+                  if [ -n "$pid" ]
+                  then
+                    echo "$NAME is running with pid: $pid"
+                  else
+                    echo "$NAME is not running"
+                  fi
+                }
+
+                function stop {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "Stopping $NAME"
+                      /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+
+                      kwait=$SHUTDOWN_WAIT
+                      count=0;
+                      until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                      do
+                        echo -n -e "\nwaiting for processes to exit";
+                        sleep 1
+                        count=$count+1;
+                      done
+
+                      if [[ $count -gt $kwait ]]; then
+                        echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                        kill -9 $pid
+                      fi
+
+                      rm -f $PIDFILE
+                      echo "Stopped"
+                    else
+                      echo "$NAME is not running"
+                    fi
+
+                    return 0
+                }
+
+                case "$1" in
+                start)
+                  start
+                  status
+                ;;
+                status)
+                  status
+                ;;
+                stop)
+                  stop
+                ;;
+
+                restart)
+                  stop
+                  start
+                ;;
+
+                *)
+                  echo "Usage: $0 {status|start|stop|restart}"
+                  exit 1
+                esac
+              mode: '000755'
+              owner: root
+              group: root
+            /etc/init.d/nomad-client:
+              content: !Sub |
+                #!/bin/bash
+                # nomad-client daemon
+                # chkconfig: 345 20 80
+                # description: nomad-client daemon
+                # processname: nomad-client
+
+                DAEMON=/usr/local/bin/nomad
+
+                # On Linux, Nomad will use cgroups, and a chroot to isolate the resources of
+                # a process and as such the Nomad agent must be run as root.
+                DAEMON_USER=root
+
+                SHUTDOWN_WAIT=20
+
+                NAME=nomad-client
+                DESC="Nomad Agent"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+                DATACENTER="${AWS::Region}"
+
+                DAEMON_START_OPTS="agent \
+                    -config /etc/nomad.d/client.hcl \
+                    -config /etc/nomad.d/advertise.hcl"
+
+                function daemon_pid {
+                  cat $PIDFILE 2> /dev/null
+                }
+
+                function start {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "$NAME is already running (pid: $pid)"
+                    else
+                      echo "Starting $NAME"
+                      ulimit -n 100000
+                      umask 007
+                      touch $LOGFILE
+                      chmod 0644 $LOGFILE
+                      PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                      if [ -z $PID ]; then
+                          printf "%s\n" "Fail"
+                      else
+                          echo $PID > $PIDFILE
+                          printf "%s\n" "OK"
+                      fi
+                    fi
+
+                    return 0
+                }
+
+                function status {
+                  pid=$(daemon_pid)
+                  if [ -n "$pid" ]
+                  then
+                    echo "$NAME is running with pid: $pid"
+                  else
+                    echo "$NAME is not running"
+                  fi
+                }
+
+                function stop {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "Stopping $NAME"
+                      kill $pid 2>&1
+
+                      kwait=$SHUTDOWN_WAIT
+                      count=0;
+                      until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                      do
+                        echo -n -e "\nwaiting for processes to exit";
+                        sleep 1
+                        count=$count+1;
+                      done
+
+                      if [[ $count -gt $kwait ]]; then
+                        echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                        kill -9 $pid
+                      fi
+
+                      rm -f $PIDFILE
+                      echo "Stopped"
+                    else
+                      echo "$NAME is not running"
+                    fi
+
+                    return 0
+                }
+
+                case "$1" in
+                start)
+                  start
+                  status
+                ;;
+                status)
+                  status
+                ;;
+                stop)
+                  stop
+                ;;
+
+                restart)
+                  stop
+                  start
+                ;;
+
+                *)
+                  echo "Usage: $0 {status|start|stop|restart}"
+                  exit 1
+                esac
+              mode: '000755'
+              owner: root
+              group: root
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack = ${AWS::StackId}
+                region = ${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.rNomadClientLaunchConfiguration.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource rNomadClientLaunchConfiguration --region ${AWS::Region}
+                runas=root
+            /etc/nomad.d/client.hcl:
+              content: !Sub |
+                data_dir  = "/opt/nomad/data"
+                datacenter = "${AWS::Region}"
+                client {
+                  enabled = true
+                  network_speed = 10000
+                  options {
+                    "docker.auth.config" = "/etc/docker/docker-ecr-auth.json"
+                  }
+                }
+                consul {
+                  # The address to the Consul agent.
+                  address = "127.0.0.1:8500"
+
+                  # The service name to register the server and client with Consul.
+                  server_service_name = "nomad-server"
+                  client_service_name = "nomad-client"
+
+                  # Enables automatically registering the services.
+                  auto_advertise = true
+                }
+
+                leave_on_interrupt = true
+                leave_on_terminate = true
+                log_level = "INFO"
+              mode: '000444'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+              consul-agent:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/init.d/consul-agent
+                  - /etc/consul.d/agent/config.json
+              nomad-client:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/init.d/nomad-client
+                  - /etc/nomad.d/client.hcl
+                  - /etc/nomad.d/advertise.hcl
+              docker:
+                enabled: true
+                ensureRunning: true
+              cgconfig:
+                enabled: true
+                ensureRunning: true
+    Properties:
+      IamInstanceProfile: !ImportValue
+        Fn::Sub: "${pConsulIAMStack}-ConsulServerMemberInstanceProfile"
+      ImageId: !Ref pClusterMemberAmiId
+      InstanceMonitoring: false
+      InstanceType: !Ref pClientInstanceType
+      KeyName: !Ref pKeyName
+      SecurityGroups:
+        - !Ref rSSHAccessSecurityGroup
+        - !ImportValue
+          Fn::Sub: "${pConsulServerStack}-ConsulClusterSecurityGroup"
+        - !ImportValue
+          Fn::Sub: "${pConsulServerStack}-ConsulRPCAndGossipSecurityGroup"
+        - !ImportValue
+          Fn::Sub: "${pNomadServerStack}-NomadClusterSecurityGroup"
+        - !ImportValue
+          Fn::Sub: "${pNomadServerStack}-NomadHttpRpcSerfSecurityGroup"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum install -y \
+              aws-cfn-bootstrap \
+              unzip \
+              wget \
+              docker
+
+          function error_exit {
+            /opt/aws/bin/cfn-signal \
+                --success false \
+                --reason "$1 - look on /var/log" \
+                --stack ${AWS::StackName} \
+                --resource rNomadClientAutoScalingGroup \
+                --region ${AWS::Region}
+            exit 1
+          }
+
+          trap 'error_exit "Line no: $LINENO"' ERR
+
+          /opt/aws/bin/cfn-init \
+              --stack ${AWS::StackName} \
+              --resource rNomadClientLaunchConfiguration \
+              --region ${AWS::Region} || error_exit 'Error during initialization script'
+
+          /opt/aws/bin/cfn-signal --success true \
+              --stack ${AWS::StackName} \
+              --resource rNomadClientAutoScalingGroup \
+              --region ${AWS::Region}
+
+
+  rNomadClientAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: !Ref pDesiredClientCapacity
+      HealthCheckGracePeriod: 5
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref rNomadClientLaunchConfiguration
+      MaxSize: !Ref pMaxClientCapacity
+      MinSize: 0
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-nomad-client-asg"
+          PropagateAtLaunch: true
+        - Key: role
+          Value: nomand-client
+          PropagateAtLaunch: true
+      VPCZoneIdentifier: !Ref pSubnetIds
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        PauseTime: PT10M
+        WaitOnResourceSignals: true
+
+
+  rFabioLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_install_consul_agent:
+              command: !Sub |
+                #!/bin/bash
+
+                curl -L \
+                    -XGET 'https://releases.hashicorp.com/consul/${pConsulAgentVersion}/consul_${pConsulAgentVersion}_linux_amd64.zip' \
+                    -o /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
+
+                mkdir -p /opt/consul/data
+                unzip \
+                    /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip \
+                    -d /opt/consul
+                rm -f /tmp/consul_${pConsulAgentVersion}_linux_amd64.zip
+
+                useradd -s /bin/false -d /opt/consul -r consul
+                chown -R consul /opt/consul
+                chmod 755 /opt/consul/consul
+
+                mkdir -p /etc/consul.d
+                ln -sf /opt/consul/consul /usr/local/bin/
+            02_install_fabio:
+              command: !Sub |
+                #!/bin/bash
+
+                mkdir -p /opt/fabio
+
+                curl -L \
+                    -XGET 'https://github.com/eBay/fabio/releases/download/v1.3.8/fabio-1.3.8-go1.8-linux_amd64' \
+                    -o /opt/fabio/fabio-1.3.8-go1.8-linux_amd64
+
+                chmod 755 /opt/fabio/fabio-1.3.8-go1.8-linux_amd64
+
+                useradd -s /bin/false -d /opt/fabio -r fabio
+                chown -R fabio /opt/fabio
+
+                ln -sf /opt/fabio/fabio-1.3.8-go1.8-linux_amd64 /usr/local/bin/fabio
+          files:
+            /etc/consul.d/agent/config.json:
+              content: !Sub |
+                {
+                  "log_level": "INFO",
+                  "datacenter": "${AWS::Region}",
+                  "server": false,
+                  "disable_update_check": true,
+                  "data_dir": "/opt/consul/data",
+                  "dns_config": {
+                    "allow_stale": true,
+                    "max_stale": "3s",
+                    "node_ttl": "1m"
+                  },
+                  "skip_leave_on_interrupt": false,
+                  "leave_on_terminate": true
+                }
+              mode: '000444'
+              owner: root
+              group: root
+            /etc/init.d/consul-agent:
+              content: !Sub |
+                #!/bin/bash
+                # consul-agent daemon
+                # chkconfig: 345 20 80
+                # description: consul-agent daemon
+                # processname: consul-agent
+
+                DAEMON=/usr/local/bin/consul
+                DAEMON_USER=consul
+
+                SHUTDOWN_WAIT=20
+
+                NAME=consul-agent
+                DESC="Consul Agent"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+                DATACENTER="${AWS::Region}"
+
+                ADVERTISE_IP=$(/sbin/ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}')
+
+                DAEMON_START_OPTS="agent \
+                    -domain 'consul.' \
+                    -advertise $ADVERTISE_IP \
+                    -datacenter $DATACENTER \
+                    -client 0.0.0.0 \
+                    -data-dir /opt/consul/data \
+                    -config-file /etc/consul.d/agent/config.json \
+                    -rejoin -retry-join-ec2-tag-key ${pConsulClusterTagName} \
+                    -retry-join-ec2-tag-value ${pConsulClusterTagMemberValue} \
+                    -retry-join-ec2-region ${AWS::Region}"
+
+                DAEMON_STOP_OPTS="leave"
+
+                function daemon_pid {
+                  cat $PIDFILE 2> /dev/null
+                }
+
+                function start {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "$NAME is already running (pid: $pid)"
+                    else
+                      echo "Starting $NAME"
+                      ulimit -n 100000
+                      umask 007
+                      touch $LOGFILE
+                      chmod 0644 $LOGFILE
+                      PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                      if [ -z $PID ]; then
+                          printf "%s\n" "Fail"
+                      else
+                          echo $PID > $PIDFILE
+                          printf "%s\n" "OK"
+                      fi
+                    fi
+
+                    return 0
+                }
+
+                function status {
+                  pid=$(daemon_pid)
+                  if [ -n "$pid" ]
+                  then
+                    echo "$NAME is running with pid: $pid"
+                  else
+                    echo "$NAME is not running"
+                  fi
+                }
+
+                function stop {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "Stopping $NAME"
+                      /bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_STOP_OPTS"
+
+                      kwait=$SHUTDOWN_WAIT
+                      count=0;
+                      until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                      do
+                        echo -n -e "\nwaiting for processes to exit";
+                        sleep 1
+                        count=$count+1;
+                      done
+
+                      if [[ $count -gt $kwait ]]; then
+                        echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                        kill -9 $pid
+                      fi
+
+                      rm -f $PIDFILE
+                      echo "Stopped"
+                    else
+                      echo "$NAME is not running"
+                    fi
+
+                    return 0
+                }
+
+                case "$1" in
+                start)
+                  start
+                  status
+                ;;
+                status)
+                  status
+                ;;
+                stop)
+                  stop
+                ;;
+
+                restart)
+                  stop
+                  start
+                ;;
+
+                *)
+                  echo "Usage: $0 {status|start|stop|restart}"
+                  exit 1
+                esac
+              mode: '000755'
+              owner: root
+              group: root
+            /etc/init.d/fabio:
+              content: !Sub |
+                #!/bin/bash
+                # fabio daemon
+                # chkconfig: 345 20 80
+                # description: fabio daemon
+                # processname: fabio
+
+                DAEMON=/usr/local/bin/fabio
+
+                DAEMON_USER=fabio
+
+                SHUTDOWN_WAIT=20
+
+                NAME=fabio
+                DESC="fabio"
+                PIDFILE=/var/run/$NAME.pid
+                LOGFILE=/var/log/$NAME.log
+                SCRIPTNAME=/etc/init.d/$NAME
+
+                DAEMON_START_OPTS="fabio"
+
+                function daemon_pid {
+                  cat $PIDFILE 2> /dev/null
+                }
+
+                function start {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "$NAME is already running (pid: $pid)"
+                    else
+                      echo "Starting $NAME"
+                      ulimit -n 100000
+                      umask 007
+                      touch $LOGFILE
+                      chmod 0644 $LOGFILE
+                      PID=$(/bin/su -p -s /bin/sh -m $DAEMON_USER -c "$DAEMON $DAEMON_START_OPTS" > $LOGFILE 2>&1 & echo $!)
+                      if [ -z $PID ]; then
+                          printf "%s\n" "Fail"
+                      else
+                          echo $PID > $PIDFILE
+                          printf "%s\n" "OK"
+                      fi
+                    fi
+
+                    return 0
+                }
+
+                function status {
+                  pid=$(daemon_pid)
+                  if [ -n "$pid" ]
+                  then
+                    echo "$NAME is running with pid: $pid"
+                  else
+                    echo "$NAME is not running"
+                  fi
+                }
+
+                function stop {
+                  pid=$(daemon_pid)
+                    if [ -n "$pid" ]
+                    then
+                      echo "Stopping $NAME"
+                      kill $pid 2>&1
+
+                      kwait=$SHUTDOWN_WAIT
+                      count=0;
+                      until [ "$(ps -p $pid | grep -c $pid)" = '0' ] || [[ $count -gt $kwait ]]
+                      do
+                        echo -n -e "\nwaiting for processes to exit";
+                        sleep 1
+                        count=$count+1;
+                      done
+
+                      if [[ $count -gt $kwait ]]; then
+                        echo -n -e "\nkilling processes which didn't stop after $SHUTDOWN_WAIT seconds"
+                        kill -9 $pid
+                      fi
+
+                      rm -f $PIDFILE
+                      echo "Stopped"
+                    else
+                      echo "$NAME is not running"
+                    fi
+
+                    return 0
+                }
+
+                case "$1" in
+                start)
+                  start
+                  status
+                ;;
+                status)
+                  status
+                ;;
+                stop)
+                  stop
+                ;;
+
+                restart)
+                  stop
+                  start
+                ;;
+
+                *)
+                  echo "Usage: $0 {status|start|stop|restart}"
+                  exit 1
+                esac
+              mode: '000755'
+              owner: root
+              group: root
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack = ${AWS::StackId}
+                region = ${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.rFabioLaunchConfiguration.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource rFabioLaunchConfiguration --region ${AWS::Region}
+                runas=root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+              consul-agent:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/init.d/consul-agent
+                  - /etc/consul.d/agent/config.json
+              fabio:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/init.d/fabio
+    Properties:
+      IamInstanceProfile: !ImportValue
+        Fn::Sub: "${pConsulIAMStack}-ConsulServerMemberInstanceProfile"
+      ImageId: !Ref pClusterMemberAmiId
+      InstanceMonitoring: false
+      InstanceType: 't2.micro'
+      KeyName: !Ref pKeyName
+      SecurityGroups:
+        - !Ref rSSHAccessSecurityGroup
+        - !ImportValue
+          Fn::Sub: "${pConsulServerStack}-ConsulClusterSecurityGroup"
+        - !ImportValue
+          Fn::Sub: "${pConsulServerStack}-ConsulRPCAndGossipSecurityGroup"
+        - !ImportValue
+          Fn::Sub: "${pNomadServerStack}-NomadClusterSecurityGroup"
+        - !Ref rFabioAccessSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum install -y \
+              aws-cfn-bootstrap \
+              unzip \
+              wget
+
+          function error_exit {
+            /opt/aws/bin/cfn-signal \
+                --success false \
+                --reason "$1 - look on /var/log" \
+                --stack ${AWS::StackName} \
+                --resource rFabioAutoScalingGroup \
+                --region ${AWS::Region}
+            exit 1
+          }
+
+          trap 'error_exit "Line no: $LINENO"' ERR
+
+          /opt/aws/bin/cfn-init \
+              --stack ${AWS::StackName} \
+              --resource rFabioLaunchConfiguration \
+              --region ${AWS::Region} || error_exit 'Error during initialization script'
+
+          /opt/aws/bin/cfn-signal --success true \
+              --stack ${AWS::StackName} \
+              --resource rFabioAutoScalingGroup \
+              --region ${AWS::Region}
+
+
+  rFabioAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: 1
+      HealthCheckGracePeriod: 5
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref rFabioLaunchConfiguration
+      LoadBalancerNames:
+        - !Ref rNomadEntryLoadBalancer
+      MaxSize: 2
+      MinSize: 0
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-fabio-asg"
+          PropagateAtLaunch: true
+        - Key: role
+          Value: router
+          PropagateAtLaunch: true
+      VPCZoneIdentifier: !Ref pSubnetIds
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        PauseTime: PT10M
+        WaitOnResourceSignals: true
+
+
+  rFabioAccessSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for accessing Fabio
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref rNomadEntryAccessSecurityGroup
+          FromPort: 9998
+          IpProtocol: TCP
+          ToPort: 9999
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-fabio-sg"
+      VpcId: !Ref pVpcId
+
+
+  rNomadEntryAccessSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for accessing nomad managed services from outside
+      SecurityGroupIngress:
+        - CidrIp: !Ref pNomandEntryAccessCIDR
+          FromPort: 80
+          IpProtocol: TCP
+          ToPort: 80
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-nomadentry-sg"
+      VpcId: !Ref pVpcId
+
+
+  rSSHAccessSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for accessing nomad members by SSH
+      SecurityGroupIngress:
+        - CidrIp: !Ref pSSHAccessCIDR
+          FromPort: 22
+          IpProtocol: TCP
+          ToPort: 22
+      Tags:
+        - Key: Name
+          Value: !Sub "${pResourceNamePrefix}-ssh-sg"
+      VpcId: !Ref pVpcId
+
+
+  rNomadEntryLoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      Listeners:
+        - LoadBalancerPort: '80'
+          InstancePort: '9999'
+          Protocol: TCP
+          InstanceProtocol: TCP
+      HealthCheck:
+        Target: 'HTTP:9998/health'
+        HealthyThreshold: '3'
+        UnhealthyThreshold: '5'
+        Interval: '30'
+        Timeout: '5'
+      ConnectionDrainingPolicy:
+        Enabled: 'true'
+        Timeout: '15'
+      Policies:
+        - PolicyName: EnableProxyProtocolPolicy
+          PolicyType: ProxyProtocolPolicyType
+          InstancePorts:
+            - '9999'
+          Attributes:
+            - Name: ProxyProtocol
+              Value: true
+      SecurityGroups:
+        - !Ref rNomadEntryAccessSecurityGroup
+      Scheme: internal
+      Subnets: !Ref pSubnetIds
+
+
+  rNomadEntryDNS:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Ref pHostedZoneName
+      Comment: Alias to easier access any services managed by nomad
+      RecordSets:
+        - Name: !Sub "${pResourceNamePrefix}-entry.${pHostedZoneName}"
+          Type: A
+          AliasTarget:
+            HostedZoneId: !GetAtt [ rNomadEntryLoadBalancer, CanonicalHostedZoneNameID ]
+            DNSName: !GetAtt [ rNomadEntryLoadBalancer, DNSName ]

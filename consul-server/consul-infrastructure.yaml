@@ -488,6 +488,23 @@ Resources:
           FromPort: 80
           ToPort: 80
           IpProtocol: TCP
+        - CidrIp: !Ref pHTTPAccessCIDR
+          FromPort: 8300
+          IpProtocol: TCP
+          ToPort: 8302
+        - CidrIp: !Ref pHTTPAccessCIDR
+          FromPort: 8300
+          IpProtocol: UDP
+          ToPort: 8302
+        - CidrIp: !Ref pHTTPAccessCIDR
+          FromPort: 8600
+          IpProtocol: TCP
+          ToPort: 8600
+        - CidrIp: !Ref pHTTPAccessCIDR
+          FromPort: 8600
+          IpProtocol: UDP
+          ToPort: 8600
+
       Tags:
         - Key: Name
           Value: !Sub "${pResourceNamePrefix}-http-elb-sg"

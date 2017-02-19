@@ -630,6 +630,10 @@ Resources:
           FromPort: 20000
           IpProtocol: UDP
           ToPort: 60000
+        - SourceSecurityGroupId: !Ref rNomadClusterSecurityGroup
+          FromPort: 9998
+          IpProtocol: TCP
+          ToPort: 9999
       Tags:
         - Key: Name
           Value: !Sub "${pResourceNamePrefix}-nomad-gossip-sg"

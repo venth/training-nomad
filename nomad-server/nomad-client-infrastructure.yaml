@@ -186,10 +186,7 @@ Resources:
                 # ignore, if docker already started
                 # docker just has to work
                 service docker start 2> /dev/null
-                $(aws --region=${AWS::Region} ecr get-login)
-                cp /root/.docker/config.json /etc/docker/docker-ecr-auth.json
-
-                chmod 0440 /etc/docker/docker-ecr-auth.json
+                /opt/ecr/reauthenticate.sh
             05_install_fabio:
               command: !Sub |
                 #!/bin/bash
@@ -206,6 +203,14 @@ Resources:
                 chown -R fabio /opt/fabio
 
                 ln -sf /opt/fabio/fabio-1.3.8-go1.8-linux_amd64 /usr/local/bin/fabio
+            06_reauthenticate_in_ecr_every_30_minutes:
+              command: !Sub |
+                #!/bin/bash
+
+                touch /var/log/ecr_reauthenticate_error.log
+                chmod 0444 /var/log/ecr_reauthenticate_error.log
+
+                crontab -u root /etc/cron.d/reauthenticate_every_30_minutes
           files:
             /etc/consul.d/agent/config.json:
               content: !Sub |
@@ -581,6 +586,23 @@ Resources:
                   exit 1
                 esac
               mode: '000755'
+              owner: root
+              group: root
+            /opt/ecr/reauthenticate.sh:
+              content: !Sub |
+                #!/bin/bash
+
+                $(aws --region=${AWS::Region} ecr get-login)
+                cp -f /root/.docker/config.json /etc/docker/docker-ecr-auth.json
+
+                chmod 0440 /etc/docker/docker-ecr-auth.json
+              mode: '000750'
+              owner: root
+              group: root
+            /etc/cron.d/reauthenticate_every_30_minutes:
+              content: !Sub |
+                */30 * * * * /opt/ecr/reauthenticate.sh 2>> /var/log/ecr_reauthenticate_error.log
+              mode: '000440'
               owner: root
               group: root
             /etc/cfn/cfn-hup.conf:
